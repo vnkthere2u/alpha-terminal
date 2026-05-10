@@ -1,12 +1,11 @@
 """
-AlphaTerminal — Daily Macro Dashboard
-Architecture:
-  • Prices   → yfinance (free, no key, 15-min cache)
-  • Analysis → Gemini 2.0 Flash via 4 parallel focused calls
-               Each call covers one section → avoids giant prompt failing
-               Cached to /tmp/{date}.json → survives page reloads
-               Rate-limit safe: 4 calls in parallel, 3 retries with backoff each
-  • UI       → All controls inline in main page (no sidebar dependency)
+AlphaTerminal — Institutional Macro Dashboard  v4
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Prices       → yfinance  (individual tickers, 15-min cache)
+CB rates/CPI → Trading Economics REST API + dated fallback
+Gold AED     → Gulf News scrape → calculated fallback
+Analysis     → Gemini 2.0 Flash, JSON mode, no grounding, data-context prompt
+UI           → 100% native Streamlit components, no HTML injection in columns
 """
 
 import streamlit as st
@@ -14,966 +13,1317 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import requests
+from bs4 import BeautifulSoup
 import json
 import re
-import time
 import logging
 import warnings
 from datetime import date, datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 
-# ── silence noise ─────────────────────────────────────────────────────────────
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("peewee").setLevel(logging.CRITICAL)
 warnings.filterwarnings("ignore")
 
-# ── page config ───────────────────────────────────────────────────────────────
+# ─── PAGE CONFIG ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="AlphaTerminal · Live Macro Dashboard",
+    page_title="AlphaTerminal",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed",   # sidebar not needed
+    initial_sidebar_state="collapsed",
 )
 
-# ── palette ───────────────────────────────────────────────────────────────────
-C = dict(
-    bg="#08090d", surf="#101319", bord="#1d2330",
-    ink="#eaeef5", body="#a8b3c5", mute="#5a6577", dim="#363f51",
-    green="#2dd4a7", red="#f4516c", amber="#f0b429",
-    blue="#5b8def", purple="#a78bfa",
-)
+# ─── PALETTE ──────────────────────────────────────────────────────────────────
+G = "#2dd4a7"; R = "#f4516c"; A = "#f0b429"; B = "#5b8def"; P = "#a78bfa"
+BG = "#08090d"; SF = "#111318"; BD = "#1e2636"
+INK = "#eaeef5"; BODY = "#99adc0"; MUT = "#4a5e72"
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
+# ─── MINIMAL CSS (safe, no column injection) ──────────────────────────────────
 st.markdown(f"""<style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700
-  &family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700;9..40,800
-  &family=Instrument+Serif:ital@0;1&display=swap');
-
-*{{box-sizing:border-box;margin:0;padding:0}}
-html,body,[class*="css"],.stApp{{background:{C["bg"]} !important;
-  font-family:"DM Sans",sans-serif !important;color:{C["body"]}}}
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=DM+Sans:wght@400;600;700;800&display=swap');
+html,body,[class*="css"],.stApp{{background:{BG}!important;font-family:'DM Sans',sans-serif!important}}
 #MainMenu,footer,header,.stDeployButton{{visibility:hidden;display:none}}
-.main .block-container{{padding-top:.6rem;max-width:1440px}}
-div[data-testid="stSidebar"]{{display:none !important}}
-
-/* buttons */
-.stButton>button{{background:{C["green"]} !important;color:{C["bg"]} !important;
-  font-weight:700 !important;border:none !important;border-radius:6px !important;
-  font-size:12px !important;box-shadow:0 2px 10px rgba(45,212,167,.2) !important}}
-.stButton>button:hover{{box-shadow:0 4px 18px rgba(45,212,167,.4) !important;
-  transform:translateY(-1px)}}
-.stButton>button:disabled{{opacity:.45 !important;cursor:not-allowed !important}}
-button[kind="secondary"]{{background:{C["surf"]} !important;color:{C["body"]} !important;
-  border:1px solid {C["bord"]} !important}}
-
-/* metrics */
-div[data-testid="metric-container"]{{background:{C["surf"]};
-  border:1px solid {C["bord"]};border-radius:8px;padding:10px 13px}}
-div[data-testid="metric-container"] label{{color:{C["mute"]} !important;
-  font-family:"JetBrains Mono",monospace !important;font-size:9px !important;
-  letter-spacing:1.2px !important}}
-div[data-testid="stMetricValue"]{{color:{C["ink"]} !important;
-  font-family:"JetBrains Mono",monospace !important;font-size:19px !important;font-weight:700 !important}}
-div[data-testid="stMetricDelta"]{{font-family:"JetBrains Mono",monospace !important;font-size:11px !important}}
-
-/* misc */
-div[data-testid="stMarkdownContainer"] p{{color:{C["body"]}}}
-.stSpinner>div{{border-top-color:{C["green"]} !important}}
-.stProgress .st-bo{{background:{C["green"]} !important}}
-hr{{border-color:{C["bord"]} !important;margin:.5rem 0}}
+div[data-testid="stSidebar"]{{display:none!important}}
+.main .block-container{{padding-top:.5rem;max-width:1440px;padding-left:1.5rem;padding-right:1.5rem}}
+.stButton>button{{background:{G}!important;color:{BG}!important;font-weight:700!important;
+  border:none!important;border-radius:6px!important;font-size:12px!important;
+  box-shadow:0 2px 10px rgba(45,212,167,.25)!important;transition:all .2s!important}}
+.stButton>button:hover{{box-shadow:0 4px 20px rgba(45,212,167,.45)!important;transform:translateY(-1px)!important}}
+button[kind="secondary"]{{background:{SF}!important;color:{BODY}!important;border:1px solid {BD}!important}}
+div[data-testid="metric-container"]{{background:{SF}!important;border:1px solid {BD}!important;
+  border-radius:8px!important;padding:10px 13px!important}}
+div[data-testid="metric-container"] label{{color:{MUT}!important;
+  font-family:'JetBrains Mono',monospace!important;font-size:9px!important;letter-spacing:1px!important}}
+div[data-testid="stMetricValue"]{{color:{INK}!important;font-family:'JetBrains Mono',monospace!important;
+  font-size:18px!important;font-weight:700!important}}
+div[data-testid="stMetricDelta"]{{font-family:'JetBrains Mono',monospace!important;font-size:11px!important}}
+div[data-testid="stMarkdownContainer"] p{{color:{BODY}!important}}
+.stSpinner>div{{border-top-color:{G}!important}}
+hr{{border-color:{BD}!important;margin:4px 0!important}}
+.stAlert{{border-radius:8px!important}}
+div[data-testid="stExpander"]{{border:1px solid {BD}!important;border-radius:8px!important;background:{SF}!important}}
 </style>""", unsafe_allow_html=True)
 
-# ── constants ─────────────────────────────────────────────────────────────────
-AED_PEG = 3.6725
-GRAM_OZ = 31.1035
-TODAY   = str(date.today())
-CACHE_F = Path(f"/tmp/alpha_{TODAY}.json")
+# ─── CONSTANTS ────────────────────────────────────────────────────────────────
+AED_PEG  = 3.6725
+TROY_OZ  = 31.1035
+TODAY    = str(date.today())
 
-CORE_SYMS = {
-    "^GSPC":"S&P 500","^IXIC":"Nasdaq","^DJI":"Dow Jones",
-    "^NSEI":"Nifty 50","^BSESN":"Sensex","^N225":"Nikkei",
-    "^HSI":"Hang Seng","^GDAXI":"DAX",
-    "GC=F":"Gold","CL=F":"WTI Crude","SI=F":"Silver",
-    "HG=F":"Copper","NG=F":"Nat Gas","BTC-USD":"Bitcoin",
-    "DX-Y.NYB":"DXY","^VIX":"VIX","AEDIINR=X":"AED/INR",
+# CB fallback — authoritative last-known values with actual revision dates
+# TE API overrides rate/cpi/dates on success; these show when TE unavailable
+CB_FALLBACK = {
+    "US":    dict(bank="Fed",  flag="🇺🇸", rate=4.75, rp=5.25, rd="Dec 2024",
+                  cpi=2.8, cpip=3.0, cpid="Apr 2025", stance="cut",  next="Jun 2025"),
+    "India": dict(bank="RBI",  flag="🇮🇳", rate=6.00, rp=6.25, rd="Apr 2025",
+                  cpi=4.6, cpip=4.9, cpid="Mar 2025", stance="cut",  next="Jun 2025"),
+    "UK":    dict(bank="BOE",  flag="🇬🇧", rate=4.25, rp=4.50, rd="Feb 2025",
+                  cpi=2.6, cpip=2.8, cpid="Mar 2025", stance="cut",  next="May 2025"),
+    "Euro":  dict(bank="ECB",  flag="🇪🇺", rate=2.40, rp=2.65, rd="Apr 2025",
+                  cpi=2.2, cpip=2.3, cpid="Mar 2025", stance="cut",  next="Jun 2025"),
+    "Japan": dict(bank="BOJ",  flag="🇯🇵", rate=0.50, rp=0.25, rd="Jan 2025",
+                  cpi=3.6, cpip=3.5, cpid="Mar 2025", stance="hike", next="Jun 2025"),
+    "China": dict(bank="PBOC", flag="🇨🇳", rate=3.10, rp=3.35, rd="Oct 2024",
+                  cpi=-0.1, cpip=0.1, cpid="Mar 2025", stance="cut", next="—"),
 }
-US_SEC = {
-    "XLK":"Technology","XLF":"Financials","XLV":"Healthcare",
-    "XLE":"Energy","XLB":"Materials","XLI":"Industrials",
-    "XLY":"Consumer Disc.","XLP":"Consumer Stap.","XLU":"Utilities",
-    "XLRE":"Real Estate","XLC":"Comm. Services",
+
+# TE country slugs → dashboard keys
+TE_MAP = {
+    "United States": "US", "India": "India",
+    "United Kingdom": "UK", "Euro Area": "Euro",
+    "Japan": "Japan", "China": "China",
 }
-IN_SEC = {
-    "^CNXIT":"IT","^NSEBANK":"Banking","^CNXPHARMA":"Pharma",
-    "^CNXAUTO":"Auto","^CNXFMCG":"FMCG","^CNXMETAL":"Metal",
-    "^CNXENERGY":"Energy","^CNXREALTY":"Realty","^CNXINFRA":"Infra",
-    "^CNXMEDIA":"Media","^CNXPSUBANK":"PSU Bank",
-}
-YIELD_MAP = [
-    ("US",      "🇺🇸", ["^TNX"],                      ["^IRX"]),
-    ("Germany", "🇩🇪", ["^GDBR10","^BUND"],            []),
-    ("UK",      "🇬🇧", ["^TMBMKGB-10Y","^GBGB10YT"],   []),
-    ("Japan",   "🇯🇵", ["^JRGB","^TMBMKJP-10Y"],       []),
-    ("India",   "🇮🇳", ["INDGB10Y=X","IN10YT=RR"],      []),
-    ("China",   "🇨🇳", ["CNGB10Y=X","CN10YT=RR"],       []),
-]
-GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash-preview-05-20", "gemini-1.5-flash-latest"]
+TE_COUNTRIES = "united%20states,india,united%20kingdom,euro%20area,japan,china"
+
+# Gemini
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_FALLBACK_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
+
+# ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are a senior macro strategist at a $30B global macro hedge fund, with 20+ years spanning multiple credit cycles, currency crises, and regime shifts. Your morning note is read by CTOs, CIOs, and senior PMs who live in data terminals all day — they do NOT need the numbers restated.
+
+YOUR ANALYTICAL MANDATE:
+1. MACRO REGIME: Identify the current regime (late-cycle, risk-off, stagflation, reflation, etc.) and what historical parallels suggest happens next
+2. SECOND-ORDER EFFECTS: Not what the data shows — what it CAUSES next, downstream, in 30-90 days
+3. CROSS-ASSET PROPAGATION: How each macro development ripples into FX, rates, equities, commodities simultaneously
+4. INSTITUTIONAL POSITIONING: What are hedge funds, real money, and sovereign wealth funds likely doing given these signals — follow the smart money logic
+5. CONTRARIAN INTELLIGENCE: Where is consensus wrong, complacent, or missing a non-linear risk
+6. CATALYST CALENDAR: The specific upcoming events (data releases, CB meetings, geopolitical deadlines) that could break or confirm the current thesis
+
+TONE & DEPTH REQUIREMENTS:
+- Every sentence must earn its place — no filler, no obvious observations
+- Use precise financial language: yield curve dynamics, convexity, carry, duration, risk premium, reflexivity
+- Reference historical analogues when relevant (2015 China devaluation, 2018 EM crisis, 1994 bond massacre, etc.)
+- Trade picks must have specific thesis, catalyst, risk, and expected timeline — not just "buy gold"
+
+DO NOT: Restate the data. Use phrases like "markets are watching" or "investors are cautious." State the obvious.
+DO: Provide the insight that separates a $30B PM from a Bloomberg terminal."""
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PRICE FETCHING  (yfinance, free, no API key)
+# DATA FETCHING
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _yf_ticker(sym: str) -> dict:
+    """Fetch single ticker via yfinance. Returns price/prev/pct dict."""
+    try:
+        hist = yf.Ticker(sym).history(period="5d", auto_adjust=True)
+        if hist.empty: return {}
+        cl = hist["Close"].dropna()
+        if len(cl) < 1: return {}
+        last = float(cl.iloc[-1])
+        prev = float(cl.iloc[-2]) if len(cl) >= 2 else None
+        pct  = ((last - prev) / prev * 100) if prev and prev != 0 else None
+        return {"price": last, "prev": prev, "pct": pct,
+                "date": str(cl.index[-1].date())}
+    except Exception:
+        return {}
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_prices() -> dict:
-    result: dict = {}
-    # Batch — core symbols
-    batch = [s for s in list(CORE_SYMS) + list(US_SEC) + list(IN_SEC) if s != "AEDIINR=X"]
-    try:
-        raw = yf.download(batch, period="5d", auto_adjust=True,
-                          progress=False, threads=True, group_by="ticker")
-        if not raw.empty:
-            lvl0 = raw.columns.get_level_values(0) if hasattr(raw.columns,"get_level_values") else []
-            for sym in batch:
-                try:
-                    cl = (raw[sym]["Close"] if sym in lvl0 else raw["Close"]).dropna()
-                    if len(cl) < 1: continue
-                    last = float(cl.iloc[-1]); prev = float(cl.iloc[-2]) if len(cl)>=2 else None
-                    result[sym] = {"price":last,"prev":prev,
-                                   "pct":((last-prev)/prev*100) if prev else None}
-                except Exception: continue
-    except Exception: pass
+    """Fetch all market prices via yfinance individual calls."""
+    syms = {
+        # Indices
+        "^GSPC": "SP500",  "^IXIC": "Nasdaq", "^DJI": "Dow",
+        "^NSEI": "Nifty50","^BSESN": "Sensex","^N225": "Nikkei",
+        "^HSI":  "HangSeng","^GDAXI": "DAX",
+        # Commodities
+        "GC=F":  "Gold",  "CL=F":  "Crude",  "SI=F": "Silver",
+        "HG=F":  "Copper","NG=F":  "NatGas",
+        # FX & macro
+        "DX-Y.NYB": "DXY", "^VIX": "VIX",
+        "BTC-USD":  "Bitcoin",
+        "USDINR=X": "USDINR", "AEDIINR=X": "AEDIINR",
+        # Yields (individual — batch drops international bonds)
+        "^TNX":    "US10Y",  "^IRX":   "US3M",
+        "^GDBR10": "DE10Y",  "^JRGB":  "JP10Y",
+        # US sectors (ETFs)
+        "XLK": "secTech",  "XLF": "secFin",  "XLV": "secHlth",
+        "XLE": "secEnrg",  "XLB": "secMatl", "XLI": "secInds",
+        "XLY": "secCyc",   "XLP": "secStpl", "XLU": "secUtil",
+        "XLRE":"secRE",    "XLC": "secComm",
+        # India sectors
+        "^CNXIT":    "inSIT",  "^NSEBANK": "inSBnk","^CNXPHARMA":"inSPhrm",
+        "^CNXAUTO":  "inSAut", "^CNXFMCG": "inSFmcg","^CNXMETAL": "inSMtl",
+        "^CNXENERGY":"inSEnrg","^CNXREALTY":"inSRlt","^CNXINFRA": "inSInf",
+        "^CNXMEDIA": "inSMed", "^CNXPSUBANK":"inSPSU",
+    }
+    results = {}
+    for sym, key in syms.items():
+        d = _yf_ticker(sym)
+        if d:
+            results[key] = d
 
-    # Individual — yields + AED/INR (fail in batch)
-    indiv_syms = ["AEDIINR=X"] + [s for row in YIELD_MAP for s in row[2]+row[3]]
-    seen = set()
-    for sym in dict.fromkeys(indiv_syms):
-        if sym in result: continue
-        meta_country = next((row[0] for row in YIELD_MAP if sym in row[2]+row[3]), None)
-        if meta_country and meta_country in seen: continue
-        try:
-            hist = yf.Ticker(sym).history(period="5d", auto_adjust=True)
-            if hist.empty: continue
-            cl = hist["Close"].dropna()
-            if len(cl)<1: continue
-            last=float(cl.iloc[-1]); prev=float(cl.iloc[-2]) if len(cl)>=2 else None
-            result[sym] = {"price":last,"prev":prev,"pct":((last-prev)/prev*100) if prev else None}
-            if meta_country: seen.add(meta_country)
-        except Exception: continue
-
-    # Gold in AED/gram 24K (derived)
-    if result.get("GC=F",{}).get("price"):
-        g = result["GC=F"]
-        result["GOLD_AED"] = {
-            "price": g["price"]/GRAM_OZ*AED_PEG,
-            "prev":  g["prev"] /GRAM_OZ*AED_PEG if g.get("prev") else None,
+    # AED/INR — try direct first, then derive from USDINR (AED pegged to USD)
+    if "AEDIINR" not in results and "USDINR" in results:
+        usd_inr = results["USDINR"]["price"]
+        results["AEDIINR"] = {
+            "price": usd_inr / AED_PEG,
+            "prev":  results["USDINR"].get("prev", usd_inr) / AED_PEG,
+            "pct":   results["USDINR"].get("pct"),
+            "date":  results["USDINR"].get("date",""),
+            "source": "calc"
         }
-    result["_at"] = datetime.now(ZoneInfo("Asia/Dubai")).strftime("%d %b %Y %H:%M %Z")
+
+    # Gold in AED/gram 24K (calculated from GC=F — always reliable)
+    if "Gold" in results:
+        gp = results["Gold"]["price"]
+        pp = results["Gold"].get("prev", gp)
+        results["GoldAED"] = {
+            "price": gp / TROY_OZ * AED_PEG,
+            "prev":  pp / TROY_OZ * AED_PEG,
+            "pct":   results["Gold"].get("pct"),
+            "source": "calc"
+        }
+
+    results["_fetched"] = datetime.now(ZoneInfo("Asia/Dubai")).strftime("%d %b %Y  %H:%M %Z")
+    return results
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_gold_aed_gulfnews() -> Optional[dict]:
+    """
+    Scrape Gulf News for Gold 24K AED/gram.
+    Falls back to None — caller uses calculated value from yfinance.
+    """
+    try:
+        resp = requests.get(
+            "https://gulfnews.com/gold-forex",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "lxml")
+        text = soup.get_text(" ", strip=True)
+        # Gulf News shows "24 Carat: 310.50" or "24-carat gold: 310.50 AED"
+        for pat in [
+            r'24\s*[Cc]arat[^\d]*(\d{2,3}\.\d{1,2})',
+            r'24K[^\d]*(\d{2,3}\.\d{1,2})',
+            r'(\d{2,3}\.\d{2})\s*AED.*24',
+        ]:
+            m = re.search(pat, text)
+            if m:
+                val = float(m.group(1))
+                if 200 < val < 600:  # sanity range for AED/gram
+                    return {"price": val, "source": "Gulf News"}
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_trading_economics() -> dict:
+    """
+    Pull CB interest rates and CPI from Trading Economics REST API.
+    Returns merged dict: fallback overridden by TE where available.
+    The TE 'LatestValueDate' gives the ACTUAL CB decision date — not fetch date.
+    """
+    result = {k: dict(v) for k, v in CB_FALLBACK.items()}
+
+    def _parse_date(s: str) -> str:
+        try:
+            return pd.to_datetime(s).strftime("%b %Y")
+        except Exception:
+            return ""
+
+    def _te_get(indicator_slug: str) -> list:
+        url = (f"https://api.tradingeconomics.com/country/"
+               f"{TE_COUNTRIES}/indicator/{indicator_slug}?c=guest:guest")
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                return r.json() if isinstance(r.json(), list) else []
+        except Exception:
+            pass
+        return []
+
+    # Interest rates
+    for item in _te_get("interest%20rate"):
+        key = TE_MAP.get(item.get("Country",""))
+        if not key: continue
+        val  = item.get("LatestValue")
+        prev = item.get("PreviousValue")
+        dt   = _parse_date(item.get("LatestValueDate",""))
+        if val  is not None: result[key]["rate"] = round(float(val),  2)
+        if prev is not None: result[key]["rp"]   = round(float(prev), 2)
+        if dt:               result[key]["rd"]   = dt   # ← actual CB decision date
+
+    # Inflation / CPI
+    for item in _te_get("inflation%20rate"):
+        key = TE_MAP.get(item.get("Country",""))
+        if not key: continue
+        val  = item.get("LatestValue")
+        prev = item.get("PreviousValue")
+        dt   = _parse_date(item.get("LatestValueDate",""))
+        if val  is not None: result[key]["cpi"]  = round(float(val),  1)
+        if prev is not None: result[key]["cpip"] = round(float(prev), 1)
+        if dt:               result[key]["cpid"] = dt   # ← actual CPI release date
+
     return result
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  GEMINI  —  4 parallel targeted calls (one per section)
-# ─────────────────────────────────────────────────────────────────────────────
-SECTIONS = {
 
-"macro": {
-"sys": "Elite macro analyst. Google Search for today's news. Return ONLY JSON, no fences.",
-"user": f"Today {TODAY}. Search Google for latest news on US/India/China/Japan/Eurozone economy, "
-        "central bank actions, yields, currency moves. Return this JSON:\n"
-        '{"mood":{"score":52,"label":"Cautious","sum":"1 sentence"},'
-        '"macro":[{"c":"US","f":"🇺🇸","hl":"headline≤12w","sum":"2-3 sentence analysis",'
-        '"sent":"bullish","km":"10Y:4.52%","cb":"CB note or empty"},'
-        '{"c":"India","f":"🇮🇳","hl":"","sum":"","sent":"neutral","km":"","cb":""},'
-        '{"c":"China","f":"🇨🇳","hl":"","sum":"","sent":"bearish","km":"","cb":""},'
-        '{"c":"Japan","f":"🇯🇵","hl":"","sum":"","sent":"neutral","km":"","cb":""},'
-        '{"c":"Eurozone","f":"🇪🇺","hl":"","sum":"","sent":"neutral","km":"","cb":""}]}\n'
-        'label→Risk-On|Cautious|Risk-Off|Volatile sent→bullish|bearish|neutral. Use "" for unknowns.',
-},
+def _build_context(prices: dict, cb: dict) -> str:
+    """
+    Compile all fetched data into a structured JSON string for Gemini.
+    Gemini analyzes this; it does not need to fetch anything itself.
+    """
+    def p(key, d=2): 
+        v = prices.get(key, {}).get("price")
+        return round(v, d) if v else None
 
-"comms": {
-"sys": "Elite commodity analyst. Google Search for today's data. Return ONLY JSON, no fences.",
-"user": f"Today {TODAY}. Search Google for Gold/Silver/Copper/WTI Crude/Natural Gas "
-        "current technical outlook, key support and resistance levels, analyst signals. Return:\n"
-        '{"comms":[{"n":"Gold","s":"XAU","out":"2-sentence outlook","sig":"hold","sup":"$2280","res":"$2400"},'
-        '{"n":"Silver","s":"XAG","out":"","sig":"buy","sup":"","res":""},'
-        '{"n":"Copper","s":"HG","out":"","sig":"buy","sup":"","res":""},'
-        '{"n":"Crude Oil","s":"WTI","out":"","sig":"hold","sup":"","res":""},'
-        '{"n":"Natural Gas","s":"NG","out":"","sig":"watch","sup":"","res":""}]}\n'
-        'sig→buy|sell|hold|watch. Use "" for unknowns.',
-},
+    def chg(key):
+        v = prices.get(key, {}).get("pct")
+        return round(v, 2) if v else None
 
-"banks": {
-"sys": "Elite CB and investment analyst. Google Search for latest data. Return ONLY JSON, no fences.",
-"user": f"Today {TODAY}. Search Google for: (1) Current policy rates and latest CPI for "
-        "Fed/RBI/BOE/ECB/BOJ/PBOC — exact numbers and dates. "
-        "(2) Generate 5 high-conviction trade ideas across US/India/Global markets. Return:\n"
-        '{"banks":[{"c":"US","f":"🇺🇸","bank":"Fed","rate":"5.25","rp":"5.50","rd":"Sep 2024",'
-        '"cpi":"3.2","cpip":"3.4","cpid":"Apr 2025","next":"Jun 11","stance":"hold"},'
-        '{"c":"India","f":"🇮🇳","bank":"RBI","rate":"","rp":"","rd":"","cpi":"","cpip":"","cpid":"","next":"","stance":"cut"},'
-        '{"c":"UK","f":"🇬🇧","bank":"BOE","rate":"","rp":"","rd":"","cpi":"","cpip":"","cpid":"","next":"","stance":"hold"},'
-        '{"c":"Euro","f":"🇪🇺","bank":"ECB","rate":"","rp":"","rd":"","cpi":"","cpip":"","cpid":"","next":"","stance":"cut"},'
-        '{"c":"Japan","f":"🇯🇵","bank":"BOJ","rate":"","rp":"","rd":"","cpi":"","cpip":"","cpid":"","next":"","stance":"hike"},'
-        '{"c":"China","f":"🇨🇳","bank":"PBOC","rate":"","rp":"","rd":"","cpi":"","cpip":"","cpid":"","next":"","stance":"cut"}],'
-        '"picks":[{"t":"etf","n":"name","reg":"Global","dir":"long","conv":"high",'
-        '"hl":"headline≤12w","thesis":"2-3 sentence thesis with catalyst and risk","tf":"3 months"},'
-        '{"t":"stock","n":"","reg":"US","dir":"long","conv":"high","hl":"","thesis":"","tf":""},'
-        '{"t":"sector","n":"","reg":"India","dir":"long","conv":"medium","hl":"","thesis":"","tf":""},'
-        '{"t":"commodity","n":"","reg":"Global","dir":"long","conv":"medium","hl":"","thesis":"","tf":""},'
-        '{"t":"etf","n":"","reg":"EM","dir":"short","conv":"low","hl":"","thesis":"","tf":""}]}\n'
-        'stance→hold|cut|hike dir→long|short|neutral conv→high|medium|low rate/cpi→plain number no % symbol.',
-},
-
-"geo": {
-"sys": "Elite geopolitical analyst. Google Search for today's themes. Return ONLY JSON, no fences.",
-"user": f"Today {TODAY}. Search Google for today's key themes hedge funds are watching: "
-        "geopolitical risks, Fed/CB watch, bond market stress, earnings season themes, "
-        "crypto moves, EM currency stress. Return:\n"
-        '{"geo":[{"cat":"Geopolitics","icon":"🌍","hl":"headline≤12w","det":"2-sentence detail","urg":"high"},'
-        '{"cat":"Fed Watch","icon":"🏦","hl":"","det":"","urg":"high"},'
-        '{"cat":"Rates & Bonds","icon":"📈","hl":"","det":"","urg":"medium"},'
-        '{"cat":"Earnings Season","icon":"📊","hl":"","det":"","urg":"medium"},'
-        '{"cat":"Crypto","icon":"₿","hl":"","det":"","urg":"low"},'
-        '{"cat":"EM Risk","icon":"🌏","hl":"","det":"","urg":"medium"}]}\n'
-        'urg→high|medium|low.',
-},
-}
-
-
-def _gemini_call(api_key: str, section_key: str) -> dict:
-    """One Gemini call for one section. 3 retries with backoff. Tries multiple models."""
-    sec = SECTIONS[section_key]
-    body = {
-        "systemInstruction": {"parts": [{"text": sec["sys"]}]},
-        "contents": [{"role":"user","parts":[{"text": sec["user"]}]}],
-        "tools": [{"google_search": {}}],
-        "generationConfig": {"maxOutputTokens": 1500, "temperature": 0.1},
+    ctx = {
+        "date": TODAY,
+        "global_indices": {
+            "SP500":   {"price": p("SP500",0),    "chg_pct": chg("SP500")},
+            "Nasdaq":  {"price": p("Nasdaq",0),   "chg_pct": chg("Nasdaq")},
+            "Dow":     {"price": p("Dow",0),      "chg_pct": chg("Dow")},
+            "Nifty50": {"price": p("Nifty50",0),  "chg_pct": chg("Nifty50")},
+            "Sensex":  {"price": p("Sensex",0),   "chg_pct": chg("Sensex")},
+            "Nikkei":  {"price": p("Nikkei",0),   "chg_pct": chg("Nikkei")},
+            "HangSeng":{"price": p("HangSeng",0), "chg_pct": chg("HangSeng")},
+            "DAX":     {"price": p("DAX",0),      "chg_pct": chg("DAX")},
+        },
+        "commodities": {
+            "Gold_USD_oz":  {"price": p("Gold"),  "chg_pct": chg("Gold")},
+            "Crude_WTI_bbl":{"price": p("Crude"), "chg_pct": chg("Crude")},
+            "Silver_USD_oz":{"price": p("Silver",3),"chg_pct": chg("Silver")},
+            "Copper_USD_lb":{"price": p("Copper",3),"chg_pct": chg("Copper")},
+            "NatGas_USD":   {"price": p("NatGas",3),"chg_pct": chg("NatGas")},
+            "Gold_AED_gram":{"price": p("GoldAED")},
+        },
+        "macro_fx": {
+            "DXY":      {"price": p("DXY"),      "chg_pct": chg("DXY")},
+            "VIX":      {"price": p("VIX"),      "chg_pct": chg("VIX")},
+            "USDINR":   {"price": p("USDINR"),   "chg_pct": chg("USDINR")},
+            "AEDIINR":  {"price": p("AEDIINR",4),"chg_pct": chg("AEDIINR")},
+            "Bitcoin":  {"price": p("Bitcoin",0),"chg_pct": chg("Bitcoin")},
+        },
+        "bond_yields_pct": {
+            "US_10Y": p("US10Y"),  "US_3M": p("US3M"),
+            "Germany_10Y": p("DE10Y"), "Japan_10Y": p("JP10Y"),
+            "US_yield_curve_spread_3M_10Y": (
+                round(p("US10Y") - p("US3M"), 2)
+                if p("US10Y") and p("US3M") else None
+            ),
+        },
+        "us_sector_performance_pct": {
+            "Technology":    chg("secTech"),  "Financials":    chg("secFin"),
+            "Healthcare":    chg("secHlth"),  "Energy":        chg("secEnrg"),
+            "Materials":     chg("secMatl"),  "Industrials":   chg("secInds"),
+            "Consumer_Disc": chg("secCyc"),   "Consumer_Stap": chg("secStpl"),
+            "Utilities":     chg("secUtil"),  "Real_Estate":   chg("secRE"),
+            "Comm_Services": chg("secComm"),
+        },
+        "india_sector_performance_pct": {
+            "IT": chg("inSIT"), "Banking": chg("inSBnk"), "Pharma": chg("inSPhrm"),
+            "Auto": chg("inSAut"), "FMCG": chg("inSFmcg"), "Metal": chg("inSMtl"),
+            "Energy": chg("inSEnrg"), "Realty": chg("inSRlt"),
+            "Infra": chg("inSInf"), "Media": chg("inSMed"), "PSU_Bank": chg("inSPSU"),
+        },
+        "central_banks": {
+            k: {
+                "policy_rate_pct": v["rate"],
+                "prev_rate_pct": v["rp"],
+                "last_changed": v["rd"],
+                "cpi_pct": v["cpi"],
+                "prev_cpi_pct": v["cpip"],
+                "cpi_date": v["cpid"],
+                "stance": v["stance"],
+                "next_meeting": v.get("next","—"),
+            }
+            for k, v in cb.items()
+        },
     }
-    for model in GEMINI_MODELS:
-        url = (f"https://generativelanguage.googleapis.com/v1beta"
-               f"/models/{model}:generateContent?key={api_key}")
-        for attempt in range(3):
+    return json.dumps(ctx, default=str)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_analysis(api_key: str, today: str) -> Optional[dict]:
+    """
+    Single Gemini call. JSON mode via responseMimeType = guaranteed clean JSON.
+    No grounding. Full data context passed in prompt.
+    Cached 24h by (api_key, today).
+    """
+    # Build fresh data snapshot for the analysis
+    prices = fetch_prices()
+    cb     = fetch_trading_economics()
+    ctx    = _build_context(prices, cb)
+
+    user_prompt = f"""Today is {today}.
+
+Here is the complete live market data snapshot fetched from verified sources:
+{ctx}
+
+Using this data as your foundation, provide an institutional-grade morning briefing in the following JSON structure.
+
+CRITICAL: Do not restate the numbers — the data terminal already shows them. Every insight must add analytical value beyond what any data feed can provide.
+
+Return ONLY this JSON (no other text):
+{{
+  "mood": {{
+    "score": <integer 0-100>,
+    "label": "<Risk-On|Cautious|Risk-Off|Volatile>",
+    "regime": "<2-3 word regime label e.g. Late-cycle tightening>",
+    "summary": "<3 sentences: current regime context, what this historically leads to, and the primary cross-asset tension>",
+    "primary_risk": "<The single most important tail risk right now>"
+  }},
+  "macro": [
+    {{
+      "country": "US", "flag": "🇺🇸",
+      "headline": "<Non-obvious headline — not a data restatement>",
+      "analysis": "<4-5 sentences: second-order effects of current conditions, cross-asset implications, what institutional investors are doing, historical parallel if relevant>",
+      "sentiment": "<bullish|bearish|neutral>",
+      "key_signal": "<The single most important metric/signal right now for this economy>",
+      "contrarian": "<1-2 sentences: what consensus narrative is wrong or being ignored>",
+      "cb_note": "<Specific CB insight — next move probability, what they are watching — or empty string>"
+    }},
+    {{"country":"India","flag":"🇮🇳","headline":"","analysis":"","sentiment":"","key_signal":"","contrarian":"","cb_note":""}},
+    {{"country":"China","flag":"🇨🇳","headline":"","analysis":"","sentiment":"","key_signal":"","contrarian":"","cb_note":""}},
+    {{"country":"Japan","flag":"🇯🇵","headline":"","analysis":"","sentiment":"","key_signal":"","contrarian":"","cb_note":""}},
+    {{"country":"Eurozone","flag":"🇪🇺","headline":"","analysis":"","sentiment":"","key_signal":"","contrarian":"","cb_note":""}}
+  ],
+  "commodities": [
+    {{
+      "name": "Gold", "signal": "<buy|sell|hold|watch>",
+      "support": "<key support level>", "resistance": "<key resistance level>",
+      "analysis": "<4 sentences: technical setup + macro driver + cross-asset relationship + specific catalyst to watch>",
+      "positioning_note": "<What COT data or ETF flows suggest about institutional positioning>"
+    }},
+    {{"name":"Silver","signal":"","support":"","resistance":"","analysis":"","positioning_note":""}},
+    {{"name":"Crude Oil","signal":"","support":"","resistance":"","analysis":"","positioning_note":""}},
+    {{"name":"Copper","signal":"","support":"","resistance":"","analysis":"","positioning_note":""}},
+    {{"name":"Natural Gas","signal":"","support":"","resistance":"","analysis":"","positioning_note":""}}
+  ],
+  "picks": [
+    {{
+      "type": "<stock|sector|etf|commodity>",
+      "name": "<ticker or name>",
+      "region": "<US|India|Global|EM>",
+      "direction": "<long|short>",
+      "conviction": "<high|medium|low>",
+      "timeframe": "<2 weeks|1 month|3 months|6 months>",
+      "headline": "<Short punchy thesis>",
+      "thesis": "<4-5 sentences: specific catalyst + entry logic + what could go wrong + expected return profile>",
+      "risk": "<The primary risk that invalidates this trade>"
+    }},
+    {{"type":"","name":"","region":"","direction":"","conviction":"","timeframe":"","headline":"","thesis":"","risk":""}},
+    {{"type":"","name":"","region":"","direction":"","conviction":"","timeframe":"","headline":"","thesis":"","risk":""}},
+    {{"type":"","name":"","region":"","direction":"","conviction":"","timeframe":"","headline":"","thesis":"","risk":""}},
+    {{"type":"","name":"","region":"","direction":"","conviction":"","timeframe":"","headline":"","thesis":"","risk":""}}
+  ],
+  "geo": [
+    {{
+      "category": "Geopolitics", "icon": "🌍",
+      "headline": "<Specific, non-generic headline>",
+      "analysis": "<4 sentences: what is happening, market impact mechanism, what hedge funds are doing, key date/catalyst>",
+      "urgency": "<high|medium|low>"
+    }},
+    {{"category":"Fed Watch","icon":"🏦","headline":"","analysis":"","urgency":""}},
+    {{"category":"Rates & Bonds","icon":"📈","headline":"","analysis":"","urgency":""}},
+    {{"category":"Earnings Season","icon":"📊","headline":"","analysis":"","urgency":""}},
+    {{"category":"Crypto","icon":"₿","headline":"","analysis":"","urgency":""}},
+    {{"category":"EM Risk","icon":"🌏","headline":"","analysis":"","urgency":""}}
+  ]
+}}"""
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    }
+    body = {
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",   # ← GUARANTEED CLEAN JSON OUTPUT
+            "maxOutputTokens": 4096,
+            "temperature": 0.35,
+        },
+    }
+
+    for url in [GEMINI_URL, GEMINI_FALLBACK_URL]:
+        for attempt in range(2):
             try:
-                resp = requests.post(url, json=body, timeout=60)
+                resp = requests.post(url, json=body, headers=headers, timeout=90)
                 if resp.status_code == 404:
-                    break                    # try next model
+                    break  # try fallback model
                 if resp.status_code == 429:
-                    if attempt < 2:
-                        time.sleep(10 * (attempt + 1))
+                    if attempt == 0:
+                        import time; time.sleep(15)
                         continue
-                    break                    # try next model
+                    break
                 resp.raise_for_status()
                 data = resp.json()
                 if "error" in data:
                     if data["error"].get("code") == 429:
-                        if attempt < 2:
-                            time.sleep(10 * (attempt + 1))
+                        if attempt == 0:
+                            import time; time.sleep(15)
                             continue
-                        break
                     break
-                parts = (data.get("candidates",[{}])[0]
-                             .get("content",{}).get("parts",[]))
-                text = "".join(p.get("text","") for p in parts if "text" in p)
-                text = re.sub(r'\[\d+\]', '', text).replace("```json","").replace("```","").strip()
-                s, e = text.find("{"), text.rfind("}")
-                if s == -1:
+                text = (data.get("candidates", [{}])[0]
+                            .get("content", {})
+                            .get("parts", [{}])[0]
+                            .get("text", ""))
+                if not text:
                     break
-                return json.loads(text[s:e+1])
+                # With responseMimeType=application/json, text IS valid JSON
+                return json.loads(text)
             except json.JSONDecodeError:
                 break
-            except requests.exceptions.Timeout:
-                if attempt < 2:
-                    time.sleep(5)
+            except Exception:
+                if attempt == 0:
+                    import time; time.sleep(5)
                     continue
                 break
-            except Exception:
-                break
-    return {}   # section failed → renders without this section, others still show
-
-
-def load_cache() -> dict | None:
-    if CACHE_F.exists():
-        try:
-            d = json.loads(CACHE_F.read_text())
-            return d if isinstance(d, dict) and d else None
-        except Exception:
-            return None
     return None
 
 
-def save_cache(data: dict):
-    try:
-        CACHE_F.parent.mkdir(parents=True, exist_ok=True)
-        CACHE_F.write_text(json.dumps(data, ensure_ascii=False))
-    except Exception:
-        pass
-
-
-def fetch_all_analysis(api_key: str) -> dict:
-    """Runs 4 Gemini section calls in PARALLEL. Returns merged dict."""
-    results: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futures = {ex.submit(_gemini_call, api_key, k): k for k in SECTIONS}
-        for fut in as_completed(futures, timeout=120):
-            key = futures[fut]
-            try:
-                results[key] = fut.result()
-            except Exception:
-                results[key] = {}
-
-    merged: dict = {}
-    merged.update(results.get("macro", {}))    # mood + macro
-    if results.get("comms"):
-        merged["comms"] = results["comms"].get("comms", [])
-    if results.get("banks"):
-        merged["banks"] = results["banks"].get("banks", [])
-        merged["picks"] = results["banks"].get("picks", [])
-    if results.get("geo"):
-        merged["geo"] = results["geo"].get("geo", [])
-
-    merged["_sections"] = {k: bool(v) for k, v in results.items()}
-    merged["_fetched"]  = datetime.now(ZoneInfo("Asia/Dubai")).strftime("%d %b %Y %H:%M %Z")
-    return merged
-
 # ─────────────────────────────────────────────────────────────────────────────
-#  HELPERS
+# PLOTLY CHARTS
 # ─────────────────────────────────────────────────────────────────────────────
-hd   = lambda v: v is not None and v != ""
-pctv = lambda s: float(m.group()) if (m := re.search(r'-?\d+(?:\.\d+)?', str(s or ""))) else 0.0
-isup = lambda s: pctv(s) >= 0
 
-def fmt(v, d=2, pre=""):
-    if v is None: return "—"
-    return f"{pre}{v:,.{d}f}" if v >= 1000 else f"{pre}{v:.{d}f}"
+def _pct_color(v):
+    if v is None: return BODY
+    return G if v >= 0 else R
 
-def sent_c(s): return C["green"] if s=="bullish" else C["red"] if s=="bearish" else C["amber"]
-def sig_c(s):  return C["green"] if s=="buy" else C["red"] if s=="sell" else C["amber"] if s=="hold" else C["blue"]
-def urg_c(u):  return C["red"] if u=="high" else C["amber"] if u=="medium" else C["green"]
-def dir_s(d):
-    if d=="long":  return "rgba(45,212,167,.1)",C["green"],"rgba(45,212,167,.22)"
-    if d=="short": return "rgba(244,81,108,.1)",C["red"],  "rgba(244,81,108,.22)"
-    return "rgba(240,180,41,.1)",C["amber"],"rgba(240,180,41,.22)"
-def stance_c(s): return C["green"] if s=="cut" else C["red"] if s=="hike" else C["amber"]
-def stance_l(s): return "↓ EASING" if s=="cut" else "↑ TIGHTENING" if s=="hike" else "◆ HOLD"
-MOOD_M = {
-    "Risk-On": (C["green"],"rgba(45,212,167,.15)"),
-    "Cautious":(C["amber"], "rgba(240,180,41,.15)"),
-    "Risk-Off": (C["red"],  "rgba(244,81,108,.15)"),
-    "Volatile": (C["blue"], "rgba(91,141,239,.15)"),
-}
 
-def panel(content_fn, title="", sub=""):
-    """Dark panel wrapper using st.container."""
-    with st.container():
-        st.markdown(
-            f'<div style="background:{C["surf"]};border:1px solid {C["bord"]};'
-            f'border-radius:11px;padding:16px;">'
-            f'<div style="font-family:monospace;font-size:9.5px;letter-spacing:1.6px;'
-            f'color:{C["mute"]};text-transform:uppercase;margin-bottom:3px;">{title}</div>'
-            f'<div style="font-family:monospace;font-size:9px;color:{C["dim"]};'
-            f'margin-bottom:11px;">{sub}</div></div>',
-            unsafe_allow_html=True,
-        )
-        content_fn()
-
-def sec_hdr(n, title, sub=""):
-    st.markdown(
-        f'<div style="display:flex;align-items:baseline;gap:11px;margin:1.8rem 0 .9rem 0;'
-        f'padding-bottom:9px;border-bottom:1px solid {C["bord"]};">'
-        f'<span style="font-family:monospace;font-size:10px;color:{C["mute"]};letter-spacing:1.4px;">{n}</span>'
-        f'<span style="font-family:\'Instrument Serif\',serif;font-size:25px;color:{C["ink"]};'
-        f'font-weight:400;letter-spacing:-.4px;">{title}</span>'
-        f'<div style="flex:1;height:1px;background:{C["bord"]};"></div>'
-        f'<span style="font-family:monospace;font-size:9.5px;color:{C["mute"]};'
-        f'letter-spacing:1px;text-transform:uppercase;">{sub}</span></div>',
-        unsafe_allow_html=True,
-    )
-
-def md(html): st.markdown(html, unsafe_allow_html=True)
-
-def small_badge(color, text):
-    return (f'<span style="display:inline-block;font-family:monospace;font-size:9px;'
-            f'font-weight:700;padding:2px 7px;border-radius:3px;letter-spacing:.5px;'
-            f'text-transform:uppercase;background:{color}22;color:{color};'
-            f'border:1px solid {color}44;">{text}</span>')
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  CHART COMPONENTS
-# ─────────────────────────────────────────────────────────────────────────────
-def mood_gauge(score=50):
-    r, cx, cy = 70, 90, 90
-    a = (score/100)*3.14159-3.14159
+def chart_gauge(score: int = 50) -> go.Figure:
+    """Semicircle mood gauge."""
     import math
-    seg = lambda s,e,col: (
-        f'<path d="M{cx+r*math.cos((s/100)*3.14159-3.14159):.1f} '
-        f'{cy+r*math.sin((s/100)*3.14159-3.14159):.1f} A{r} {r} 0 0 1 '
-        f'{cx+r*math.cos((e/100)*3.14159-3.14159):.1f} '
-        f'{cy+r*math.sin((e/100)*3.14159-3.14159):.1f}" '
-        f'stroke="{col}" stroke-width="10" fill="none" stroke-linecap="round"/>'
-    )
-    nx, ny = cx+r*math.cos(a), cy+r*math.sin(a)
-    md(f'<svg viewBox="0 0 180 110" width="160" height="100" style="display:block;margin:0 auto;">'
-       f'{seg(2,33,C["red"])}{seg(34,66,C["amber"])}{seg(67,98,C["green"])}'
-       f'<line x1="{cx}" y1="{cy}" x2="{nx:.1f}" y2="{ny:.1f}" '
-       f'stroke="{C["ink"]}" stroke-width="2.5" stroke-linecap="round"/>'
-       f'<circle cx="{cx}" cy="{cy}" r="5" fill="{C["ink"]}"/>'
-       f'<circle cx="{cx}" cy="{cy}" r="2" fill="{C["bg"]}"/>'
-       f'<text x="{cx}" y="{cy+22}" text-anchor="middle" '
-       f'font-family="monospace" font-size="20" font-weight="700" '
-       f'fill="{C["ink"]}">{score}</text></svg>')
+    r, cx, cy = 68, 90, 88
+    def arc(s, e, col):
+        a1 = (s/100)*math.pi - math.pi
+        a2 = (e/100)*math.pi - math.pi
+        return (f'<path d="M {cx+r*math.cos(a1):.1f} {cy+r*math.sin(a1):.1f} '
+                f'A {r} {r} 0 0 1 {cx+r*math.cos(a2):.1f} {cy+r*math.sin(a2):.1f}" '
+                f'stroke="{col}" stroke-width="10" fill="none" stroke-linecap="round"/>')
+    ang = (score/100)*math.pi - math.pi
+    nx, ny = cx + r*math.cos(ang), cy + r*math.sin(ang)
+    svg = (f'<svg viewBox="0 0 180 108" style="display:block;margin:0 auto;width:170px;">'
+           f'{arc(2,33,R)}{arc(34,66,A)}{arc(67,98,G)}'
+           f'<line x1="{cx}" y1="{cy}" x2="{nx:.1f}" y2="{ny:.1f}" '
+           f'stroke="{INK}" stroke-width="2.5" stroke-linecap="round"/>'
+           f'<circle cx="{cx}" cy="{cy}" r="5" fill="{INK}"/>'
+           f'<circle cx="{cx}" cy="{cy}" r="2.5" fill="{BG}"/>'
+           f'<text x="{cx}" y="{cy+22}" text-anchor="middle" font-family="JetBrains Mono,monospace" '
+           f'font-size="21" font-weight="700" fill="{INK}">{score}</text></svg>')
+    return svg
 
-def asset_bar_chart(prices):
-    syms = [("^GSPC","S&P 500"),("^IXIC","Nasdaq"),("^DJI","Dow Jones"),
-            ("^NSEI","Nifty 50"),("^BSESN","Sensex"),("^N225","Nikkei"),
-            ("^HSI","Hang Seng"),("^GDAXI","DAX"),
-            ("GC=F","Gold"),("CL=F","WTI Crude"),("BTC-USD","Bitcoin"),("DX-Y.NYB","DXY")]
+
+def chart_asset_bars(prices: dict) -> go.Figure:
+    DISPLAY = [
+        ("SP500","S&P 500"),("Nasdaq","Nasdaq"),("Dow","Dow Jones"),
+        ("Nifty50","Nifty 50"),("Sensex","Sensex"),("Nikkei","Nikkei"),
+        ("HangSeng","Hang Seng"),("DAX","DAX"),
+        ("Gold","Gold"),("Crude","WTI Crude"),("Bitcoin","Bitcoin"),("DXY","DXY"),
+    ]
     lbls, vals, cols, tips = [], [], [], []
-    for sym, lbl in syms:
-        d = prices.get(sym)
-        if d and d.get("pct") is not None:
+    for key, lbl in DISPLAY:
+        d = prices.get(key, {})
+        if d.get("pct") is not None:
             v = round(d["pct"], 2)
+            prev = d.get("prev")
+            curr = d.get("price")
             lbls.append(lbl); vals.append(v)
-            cols.append(C["green"] if v>=0 else C["red"])
-            tips.append(f"<b>{lbl}</b><br>Now: {fmt(d.get('price',0))}"
-                        f"<br>Prev: {fmt(d.get('prev',0))}<br>Chg: {'+' if v>=0 else ''}{v:.2f}%")
+            cols.append(G if v >= 0 else R)
+            sign = "+" if v >= 0 else ""
+            tip = f"<b>{lbl}</b><br>Now: {curr:,.2f}" if curr else f"<b>{lbl}</b>"
+            if prev: tip += f"<br>Prev close: {prev:,.2f}"
+            tip += f"<br>Change: {sign}{v:.2f}%"
+            tips.append(tip)
+
     if not lbls:
-        st.caption("Price data loading…"); return
-    fig = go.Figure(go.Bar(x=vals, y=lbls, orientation="h",
-        marker_color=cols, marker_line_width=0, opacity=.85,
-        text=[f"{'+' if v>=0 else ''}{v:.2f}%" for v in vals],
+        return go.Figure()
+
+    fig = go.Figure(go.Bar(
+        x=vals, y=lbls, orientation="h",
+        marker_color=cols, marker_line_width=0, opacity=0.88,
+        text=[f"{'+'if v>=0 else ''}{v:.2f}%" for v in vals],
         textposition="outside",
-        textfont={"color":C["body"],"size":10,"family":"JetBrains Mono"},
-        hovertemplate="%{customdata}<extra></extra>", customdata=tips))
-    fig.update_layout(height=max(300,len(lbls)*28),margin=dict(l=0,r=65,t=5,b=5),
-        paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=dict(showgrid=True,gridcolor=C["bord"],zerolinecolor=C["dim"],
-                   tickfont={"color":C["mute"],"size":9,"family":"JetBrains Mono"},ticksuffix="%"),
-        yaxis=dict(showgrid=False,tickfont={"color":C["body"],"size":11,"family":"DM Sans"},automargin=True),
-        bargap=.35,shapes=[dict(type="line",x0=0,x1=0,y0=-.5,y1=len(lbls)-.5,
-                                line=dict(color=C["dim"],width=1),layer="below")])
-    st.plotly_chart(fig, config={"displayModeBar":False})
+        textfont={"color": BODY, "size": 10, "family": "JetBrains Mono"},
+        hovertemplate="%{customdata}<extra></extra>",
+        customdata=tips,
+    ))
+    fig.update_layout(
+        height=max(310, len(lbls)*27), margin=dict(l=0,r=60,t=4,b=4),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(showgrid=True, gridcolor=BD, zerolinecolor=BD,
+                   tickfont={"color":MUT,"size":9,"family":"JetBrains Mono"},
+                   ticksuffix="%"),
+        yaxis=dict(showgrid=False,
+                   tickfont={"color":BODY,"size":11,"family":"DM Sans"},
+                   automargin=True),
+        bargap=0.33,
+        shapes=[dict(type="line",x0=0,x1=0,y0=-0.5,y1=len(lbls)-0.5,
+                     line=dict(color=MUT,width=1),layer="below")],
+    )
+    return fig
 
-def yield_chart(prices):
-    lbls, y10, y2, y10p = [], [], [], []
-    mx = 0
-    for cname, flag, syms10, syms2 in YIELD_MAP:
-        d10 = next((prices[s] for s in syms10 if prices.get(s,{}).get("price")), None)
-        d2  = next((prices[s] for s in syms2  if prices.get(s,{}).get("price")), None)
-        if not d10: continue
-        v10 = round(d10["price"], 2); mx = max(mx, v10)
-        lbls.append(f"{flag} {cname}"); y10.append(v10)
-        y2.append(round(d2["price"],2) if d2 else None)
-        y10p.append(round(d10["prev"],2) if d10.get("prev") else None)
+
+def chart_yields(prices: dict) -> go.Figure:
+    YIELD_ROWS = [
+        ("🇺🇸 US",      "US10Y",  "US3M"),
+        ("🇩🇪 Germany", "DE10Y",  None),
+        ("🇯🇵 Japan",   "JP10Y",  None),
+    ]
+    lbls, y10, y2, hover10 = [], [], [], []
+    max_v = 0
+    for lbl, sym10, sym2 in YIELD_ROWS:
+        d10 = prices.get(sym10, {})
+        if not d10.get("price"): continue
+        v10 = round(d10["price"], 2); max_v = max(max_v, v10)
+        d2  = prices.get(sym2, {}) if sym2 else {}
+        v2  = round(d2["price"], 2) if d2.get("price") else None
+        lbls.append(lbl); y10.append(v10); y2.append(v2)
+        prev = d10.get("prev")
+        h = f"<b>{lbl} 10Y</b><br>Now: {v10:.2f}%"
+        if prev: h += f"<br>Prev: {prev:.2f}%"
+        hover10.append(h)
+
     if not lbls:
-        st.caption("Yield data loading…"); return
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=y10,y=lbls,orientation="h",name="10Y",
-        marker_color=C["purple"],marker_line_width=0,opacity=.85,
-        text=[f"{v:.2f}%" for v in y10],textposition="outside",
-        textfont={"color":C["body"],"size":10,"family":"JetBrains Mono"}))
-    if any(v is not None for v in y2):
-        fig.add_trace(go.Bar(x=[v or 0 for v in y2],y=lbls,orientation="h",name="2Y/3M",
-            marker_color=C["blue"],marker_line_width=0,opacity=.65,
-            text=[f"{v:.2f}%" if v else "" for v in y2],textposition="outside",
-            textfont={"color":C["body"],"size":10,"family":"JetBrains Mono"}))
-    fig.update_layout(barmode="overlay",height=max(220,len(lbls)*42),
-        margin=dict(l=0,r=60,t=5,b=5),paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=dict(showgrid=True,gridcolor=C["bord"],zerolinecolor=C["dim"],
-                   tickfont={"color":C["mute"],"size":9,"family":"JetBrains Mono"},ticksuffix="%"),
-        yaxis=dict(showgrid=False,tickfont={"color":C["body"],"size":11,"family":"DM Sans"},automargin=True),
-        legend=dict(orientation="h",x=0,y=-0.1,font={"color":C["mute"],"size":10},
-                    bgcolor="rgba(0,0,0,0)"),bargap=.3)
-    st.plotly_chart(fig, config={"displayModeBar":False})
+        return go.Figure()
 
-def sector_heatmap(sector_dict, prices, title):
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=y10, y=lbls, orientation="h", name="10Y",
+        marker_color=P, marker_line_width=0, opacity=0.88,
+        text=[f"{v:.2f}%" for v in y10], textposition="outside",
+        textfont={"color":BODY,"size":10,"family":"JetBrains Mono"},
+        hovertemplate="%{customdata}<extra></extra>", customdata=hover10,
+    ))
+    non_none_y2 = [v for v in y2 if v is not None]
+    if non_none_y2:
+        fig.add_trace(go.Bar(
+            x=[v or 0 for v in y2], y=lbls, orientation="h", name="2Y/3M",
+            marker_color=B, marker_line_width=0, opacity=0.65,
+            text=[f"{v:.2f}%" if v else "" for v in y2], textposition="outside",
+            textfont={"color":BODY,"size":10,"family":"JetBrains Mono"},
+        ))
+    fig.update_layout(
+        barmode="overlay", height=max(180, len(lbls)*55),
+        margin=dict(l=0,r=55,t=4,b=4),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(showgrid=True,gridcolor=BD,zerolinecolor=BD,
+                   tickfont={"color":MUT,"size":9,"family":"JetBrains Mono"},
+                   ticksuffix="%"),
+        yaxis=dict(showgrid=False,
+                   tickfont={"color":BODY,"size":12,"family":"DM Sans"},
+                   automargin=True),
+        legend=dict(orientation="h",x=0,y=-0.12,
+                    font={"color":MUT,"size":10},bgcolor="rgba(0,0,0,0)"),
+        bargap=0.28,
+    )
+    return fig
+
+
+def chart_treemap(sector_prices: dict, title: str) -> Optional[go.Figure]:
     names, vals, pcts, texts = [], [], [], []
-    for sym, lbl in sector_dict.items():
-        d = prices.get(sym)
-        if d and d.get("pct") is not None:
-            v = round(d["pct"], 2)
-            names.append(lbl); vals.append(abs(v)+0.05); pcts.append(v)
-            texts.append(f"{'+' if v>=0 else ''}{v:.2f}%")
-    if not names:
-        st.caption("Sector data unavailable"); return
+    for name, d in sector_prices.items():
+        v = d.get("pct")
+        if v is None: continue
+        v = round(v, 2)
+        names.append(name); vals.append(abs(v)+0.05); pcts.append(v)
+        texts.append(f"{'+'if v>=0 else ''}{v:.2f}%")
+    if not names: return None
+
     fig = go.Figure(go.Treemap(
         labels=names, parents=[""]*len(names), values=vals,
         text=texts, texttemplate="<b>%{label}</b><br>%{text}",
         hovertemplate="<b>%{label}</b><br>%{text}<extra></extra>",
         marker=dict(
             colors=pcts,
-            colorscale=[[0,"rgba(180,40,60,.8)"],[.35,"rgba(100,30,50,.5)"],
-                        [.5,"rgba(22,27,37,.9)"],[.65,"rgba(15,60,50,.5)"],
-                        [1,"rgba(30,160,110,.85)"]],
-            cmid=0, line=dict(width=1.5,color=C["bg"])),
+            colorscale=[[0,"rgba(160,35,55,.85)"],[.35,"rgba(80,25,40,.55)"],
+                        [.5,"rgba(18,22,32,.9)"],[.65,"rgba(12,55,45,.55)"],
+                        [1,"rgba(25,150,100,.85)"]],
+            cmid=0, line=dict(width=1.5, color=BG),
+        ),
+        textfont={"family":"DM Sans","size":12,"color":INK},
         pathbar_visible=False,
-        textfont={"family":"DM Sans","size":12,"color":C["ink"]}))
-    fig.update_layout(title=dict(text=title,font={"color":C["mute"],"size":11,
-                      "family":"JetBrains Mono"},x=0,pad=dict(l=0,t=0)),
-        height=270, margin=dict(l=0,r=0,t=28,b=0),
-        paper_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(fig, config={"displayModeBar":False})
+    ))
+    fig.update_layout(
+        title=dict(text=title, font={"color":MUT,"size":11,"family":"JetBrains Mono"}, x=0),
+        height=265, margin=dict(l=0,r=0,t=28,b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SECTION RENDERERS
+# HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-def render_hero(prices, analysis):
-    mood = analysis.get("mood",{}) if analysis else {}
-    score = int(mood.get("score",50)) if hd(mood.get("score")) else 50
-    label = mood.get("label","—")
-    mc, mbg = MOOD_M.get(label, (C["amber"],"rgba(240,180,41,.12)"))
 
-    c1, c2, c3 = st.columns([1.1, 1.5, 1.3])
+def hd(v): return v is not None and v != ""
+
+def fmt_num(v, d=2, prefix="", suffix=""):
+    if v is None: return "—"
+    if abs(v) >= 1000:
+        return f"{prefix}{v:,.{d}f}{suffix}"
+    return f"{prefix}{v:.{d}f}{suffix}"
+
+def pct_str(v, d=2):
+    if v is None: return "—"
+    return f"{'+'if v>=0 else ''}{v:.{d}f}%"
+
+def stance_color(s):
+    return G if s == "cut" else R if s == "hike" else A
+
+def stance_label(s):
+    return "↓ EASING" if s == "cut" else "↑ TIGHTENING" if s == "hike" else "◆ HOLD"
+
+def sent_color(s):
+    return G if s == "bullish" else R if s == "bearish" else A
+
+def sig_color(s):
+    return G if s == "buy" else R if s == "sell" else A if s == "hold" else B
+
+def urgency_color(u):
+    return R if u == "high" else A if u == "medium" else G
+
+def dir_color(d):
+    return G if d == "long" else R
+
+def conv_dots(level):
+    n = {"high":3,"medium":2,"low":1}.get(level,1)
+    c = {"high":G,"medium":A,"low":MUT}.get(level,MUT)
+    dots = "".join(
+        f'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;'
+        f'background:{""+c if i<n else BD};margin-right:2px;"></span>'
+        for i in range(3)
+    )
+    return dots
+
+def section_title(n, title, sub=""):
+    """Section header with number, serif title, and optional sub-label."""
+    st.markdown(
+        f'<div style="display:flex;align-items:baseline;gap:10px;'
+        f'margin:1.6rem 0 .8rem 0;padding-bottom:8px;border-bottom:1px solid {BD};">'
+        f'<span style="font-family:JetBrains Mono,monospace;font-size:10px;'
+        f'color:{MUT};letter-spacing:1.4px;">{n}</span>'
+        f'<span style="font-size:1.5rem;font-weight:800;color:{INK};letter-spacing:-.3px;">{title}</span>'
+        f'<div style="flex:1;height:1px;background:{BD};"></div>'
+        f'<span style="font-family:JetBrains Mono,monospace;font-size:9px;'
+        f'color:{MUT};letter-spacing:1px;text-transform:uppercase;">{sub}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+def color_bar(color: str):
+    """Single-line colored bar — safe HTML, no nesting."""
+    st.markdown(
+        f'<div style="height:3px;background:{color};'
+        f'border-radius:2px;margin-bottom:8px;"></div>',
+        unsafe_allow_html=True,
+    )
+
+def mini_badge(text, color):
+    st.markdown(
+        f'<span style="display:inline-block;font-family:JetBrains Mono,monospace;'
+        f'font-size:9px;font-weight:700;padding:2px 7px;border-radius:3px;'
+        f'letter-spacing:.5px;text-transform:uppercase;'
+        f'background:{color}22;color:{color};border:1px solid {color}44;">'
+        f'{text}</span>',
+        unsafe_allow_html=True,
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION RENDERERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_hero(prices, analysis, gn_gold):
+    """Hero row: Mood + VIX/DXY/AED/Gold | Asset bars | Yields"""
+    mood = analysis.get("mood", {}) if analysis else {}
+    score = int(mood.get("score", 50)) if mood.get("score") is not None else 50
+    label = mood.get("label", "—")
+    regime = mood.get("regime", "")
+
+    c1, c2, c3 = st.columns([1.15, 1.55, 1.3])
+
+    # ── MOOD PANEL ─────────────────────────────────────────────────────────
     with c1:
-        md(f'<div style="background:{C["surf"]};border:1px solid {C["bord"]};'
-           f'border-radius:11px;padding:15px 15px 8px 15px;">'
-           f'<div style="font-family:monospace;font-size:9px;letter-spacing:1.8px;'
-           f'color:{C["mute"]};text-transform:uppercase;margin-bottom:12px;">Market Mood</div>')
-        mood_gauge(score)
-        md(f'<div style="text-align:center;margin:6px 0 4px;">'
-           f'<span style="background:{mbg};color:{mc};border:1px solid {mc}44;'
-           f'border-radius:20px;padding:3px 14px;font-family:monospace;'
-           f'font-size:13px;font-weight:700;">{label}</span></div>')
-        if hd(mood.get("sum")):
-            md(f'<div style="font-family:\'Instrument Serif\',serif;font-style:italic;'
-               f'font-size:11px;color:{C["body"]};text-align:center;line-height:1.5;'
-               f'padding:0 4px 8px;">{mood["sum"]}</div>')
+        with st.container(border=True):
+            st.markdown(
+                f'<p style="font-family:JetBrains Mono,monospace;font-size:9px;'
+                f'letter-spacing:1.8px;color:{MUT};text-transform:uppercase;margin:0;">Market Mood</p>',
+                unsafe_allow_html=True,
+            )
+            # SVG gauge
+            st.markdown(chart_gauge(score), unsafe_allow_html=True)
+            # Label
+            mood_col = {
+                "Risk-On":G,"Cautious":A,"Risk-Off":R,"Volatile":B
+            }.get(label, A)
+            st.markdown(
+                f'<div style="text-align:center;margin:4px 0;">'
+                f'<span style="background:{mood_col}22;color:{mood_col};'
+                f'border:1px solid {mood_col}44;border-radius:20px;'
+                f'padding:4px 14px;font-family:JetBrains Mono,monospace;'
+                f'font-size:13px;font-weight:700;">{label}</span></div>'
+                + (f'<p style="text-align:center;font-size:10px;color:{MUT};'
+                   f'font-family:JetBrains Mono,monospace;margin:3px 0;">{regime}</p>'
+                   if regime else ""),
+                unsafe_allow_html=True,
+            )
+            if hd(mood.get("summary")):
+                st.caption(mood["summary"])
 
-        # Stats row: VIX DXY AED/INR Gold AED
-        vix = prices.get("^VIX",{}); dxy = prices.get("DX-Y.NYB",{})
-        aed = prices.get("AEDIINR=X",{}); ga = prices.get("GOLD_AED",{})
-        stats = []
-        if vix.get("price"): stats.append(("VIX",f"{vix['price']:.1f}",f"prev {vix['prev']:.1f}" if vix.get("prev") else ""))
-        if dxy.get("price"): stats.append(("DXY",f"{dxy['price']:.2f}",f"prev {dxy['prev']:.2f}" if dxy.get("prev") else ""))
-        if aed.get("price"): stats.append(("AED/INR",f"{aed['price']:.4f}",f"prev {aed['prev']:.4f}" if aed.get("prev") else ""))
-        if ga.get("price"):  stats.append(("GOLD/g 24K",f"AED {ga['price']:.2f}",f"prev {ga['prev']:.2f}" if ga.get("prev") else ""))
-        if stats:
-            inner = "".join(f'<div style="flex:1;display:flex;flex-direction:column;align-items:center;'
-                            f'padding:5px 4px;border-right:1px solid {C["bord"]};" '
-                            f'class="ls">'
-                            f'<div style="font-family:monospace;font-size:8px;color:{C["mute"]};'
-                            f'letter-spacing:.9px;text-transform:uppercase;">{s[0]}</div>'
-                            f'<div style="font-family:monospace;font-size:12px;font-weight:700;'
-                            f'color:{C["ink"]};margin-top:1px;">{s[1]}</div>'
-                            f'<div style="font-family:monospace;font-size:8px;color:{C["mute"]};">{s[2]}</div>'
-                            f'</div>' for s in stats)
-            md(f'<div style="display:flex;border-top:1px solid {C["bord"]};margin-top:6px;">'
-               f'{inner}</div>'
-               f'<style>.ls:last-child{{border-right:none!important}}</style>')
-        md('</div>')
+            st.divider()
 
+            # Stats: VIX | DXY | AED/INR | Gold AED
+            vix = prices.get("VIX", {}); dxy = prices.get("DXY", {})
+            aed = prices.get("AEDIINR", {}); ga  = prices.get("GoldAED", {})
+            # Override Gold AED with Gulf News if available
+            if gn_gold and gn_gold.get("price"):
+                ga = {"price": gn_gold["price"], "prev": ga.get("prev"), "pct": None,
+                      "source": "Gulf News"}
+
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                if vix.get("price"):
+                    st.metric("VIX",
+                              f"{vix['price']:.1f}",
+                              delta=pct_str(vix.get("pct")) if vix.get("pct") else None,
+                              delta_color="inverse")
+                if aed.get("price"):
+                    src = " (calc)" if aed.get("source") == "calc" else ""
+                    st.metric(f"AED/INR{src}", f"{aed['price']:.4f}",
+                              delta=pct_str(aed.get("pct")) if aed.get("pct") else None,
+                              delta_color="normal")
+            with sc2:
+                if dxy.get("price"):
+                    st.metric("DXY", f"{dxy['price']:.2f}",
+                              delta=pct_str(dxy.get("pct")) if dxy.get("pct") else None,
+                              delta_color="inverse")
+                if ga.get("price"):
+                    src = ga.get("source","")
+                    st.metric(f"Gold/g 24K ({src})",
+                              f"AED {ga['price']:.2f}",
+                              delta=pct_str(ga.get("pct")) if ga.get("pct") else None,
+                              delta_color="normal")
+
+    # ── ASSET PERFORMANCE ────────────────────────────────────────────────────
     with c2:
-        md(f'<div style="background:{C["surf"]};border:1px solid {C["bord"]};'
-           f'border-radius:11px;padding:15px;">'
-           f'<div style="font-family:monospace;font-size:9px;letter-spacing:1.8px;'
-           f'color:{C["mute"]};text-transform:uppercase;margin-bottom:3px;">Asset Performance — vs Prior Close</div>'
-           f'<div style="font-family:monospace;font-size:9px;color:{C["dim"]};margin-bottom:10px;">'
-           f'CURRENT · CHANGE % · PREV CLOSE · YAHOO FINANCE</div>')
-        asset_bar_chart(prices)
-        md('</div>')
+        with st.container(border=True):
+            st.markdown(
+                f'<p style="font-family:JetBrains Mono,monospace;font-size:9px;'
+                f'letter-spacing:1.8px;color:{MUT};text-transform:uppercase;margin:0 0 3px 0;">'
+                f'Asset Performance — vs Prior Close</p>'
+                f'<p style="font-family:JetBrains Mono,monospace;font-size:8.5px;color:{BD};">'
+                f'Current price · % change · Prev close on hover</p>',
+                unsafe_allow_html=True,
+            )
+            fig = chart_asset_bars(prices)
+            if fig.data:
+                st.plotly_chart(fig, config={"displayModeBar": False})
+            else:
+                st.caption("Price data loading…")
 
+    # ── YIELDS ──────────────────────────────────────────────────────────────
     with c3:
-        md(f'<div style="background:{C["surf"]};border:1px solid {C["bord"]};'
-           f'border-radius:11px;padding:15px;">'
-           f'<div style="font-family:monospace;font-size:9px;letter-spacing:1.8px;'
-           f'color:{C["mute"]};text-transform:uppercase;margin-bottom:3px;">Sovereign Yields — 10Y + 2Y/3M</div>'
-           f'<div style="font-family:monospace;font-size:9px;color:{C["dim"]};margin-bottom:10px;">'
-           f'PURPLE = 10Y · BLUE = 2Y/3M · YAHOO FINANCE</div>')
-        yield_chart(prices)
-        md('</div>')
+        with st.container(border=True):
+            st.markdown(
+                f'<p style="font-family:JetBrains Mono,monospace;font-size:9px;'
+                f'letter-spacing:1.8px;color:{MUT};text-transform:uppercase;margin:0 0 3px 0;">'
+                f'Sovereign Yields</p>'
+                f'<p style="font-family:JetBrains Mono,monospace;font-size:8.5px;color:{BD};">'
+                f'Purple = 10Y · Blue = 3M/2Y · US · Germany · Japan</p>',
+                unsafe_allow_html=True,
+            )
+            fig = chart_yields(prices)
+            if fig.data:
+                st.plotly_chart(fig, config={"displayModeBar": False})
+            else:
+                st.caption("Yield data loading…")
+
+            # Yield curve spread
+            us10 = prices.get("US10Y",{}).get("price")
+            us3m = prices.get("US3M",{}).get("price")
+            if us10 and us3m:
+                spread = round(us10 - us3m, 2)
+                col = G if spread > 0 else R
+                st.markdown(
+                    f'<div style="font-family:JetBrains Mono,monospace;font-size:10px;'
+                    f'color:{col};margin-top:6px;">'
+                    f'US Yield Curve (10Y−3M): {spread:+.2f}%  '
+                    f'{"▲ Normal" if spread > 0 else "▼ INVERTED"}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            if hd(mood.get("primary_risk")):
+                st.warning(f"⚠ **Primary Risk:** {mood['primary_risk']}", icon="⚠️")
 
 
 def render_macro(analysis):
-    items = [m for m in (analysis.get("macro") or []) if hd(m.get("hl"))]
+    items = [m for m in (analysis.get("macro") or []) if hd(m.get("headline"))]
     if not items: return
-    sec_hdr("01","Global Macro",f"{len(items)} economies")
+    section_title("01", "Global Macro", f"{len(items)} economies")
+
     cols = st.columns(len(items))
     for i, m in enumerate(items):
-        c = sent_c(m.get("sent",""))
+        sc = sent_color(m.get("sentiment",""))
         with cols[i]:
-            md(f'<div style="border-top:3px solid {c};border:1px solid {C["bord"]};'
-               f'border-top:3px solid {c};border-radius:0 0 10px 10px;'
-               f'background:{C["surf"]};padding:14px;">'
-               f'<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;">'
-               f'<div style="display:flex;align-items:center;gap:7px;">'
-               f'<span style="font-size:21px;">{m.get("f","")}</span>'
-               f'<div><div style="font-family:\'Instrument Serif\',serif;font-size:17px;'
-               f'color:{C["ink"]};font-weight:400;letter-spacing:-.2px;">{m.get("c","")}</div>'
-               + (f'<div style="font-family:monospace;font-size:9.5px;color:{C["blue"]};margin-top:1px;">'
-                  f'{m["km"]}</div>' if hd(m.get("km")) else "")
-               + f'</div></div>{small_badge(c, m.get("sent",""))}</div>'
-               f'<div style="font-size:12.5px;font-weight:700;color:{C["ink"]};margin-bottom:5px;'
-               f'line-height:1.45;">{m.get("hl","")}</div>'
-               f'<div style="font-size:11.5px;color:{C["body"]};line-height:1.65;">{m.get("sum","")}</div>'
-               + (f'<div style="margin-top:8px;padding:5px 8px;background:rgba(91,141,239,.06);'
-                  f'border:1px solid rgba(91,141,239,.18);border-radius:5px;'
-                  f'font-size:10px;color:{C["blue"]};font-family:monospace;">🏦 {m["cb"]}</div>'
-                  if hd(m.get("cb")) else "")
-               + '</div>')
+            with st.container(border=True):
+                color_bar(sc)
+                # Flag + country + sentiment
+                r1, r2 = st.columns([3,1])
+                with r1:
+                    st.markdown(
+                        f'<div style="display:flex;align-items:center;gap:8px;">'
+                        f'<span style="font-size:22px;">{m.get("flag","")}</span>'
+                        f'<span style="font-size:15px;font-weight:800;color:{INK};">{m.get("country","")}</span>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                with r2:
+                    mini_badge(m.get("sentiment","").upper(), sc)
+
+                if hd(m.get("key_signal")):
+                    st.markdown(
+                        f'<p style="font-family:JetBrains Mono,monospace;font-size:9.5px;'
+                        f'color:{B};margin:4px 0 6px 0;">{m["key_signal"]}</p>',
+                        unsafe_allow_html=True,
+                    )
+                st.markdown(f"**{m.get('headline','')}**")
+                st.markdown(m.get("analysis",""))
+
+                if hd(m.get("contrarian")):
+                    st.info(f"🔍 **Contrarian:** {m['contrarian']}")
+
+                if hd(m.get("cb_note")):
+                    st.markdown(
+                        f'<div style="background:rgba(91,141,239,.08);'
+                        f'border:1px solid rgba(91,141,239,.22);border-radius:6px;'
+                        f'padding:6px 9px;margin-top:6px;font-size:11px;color:{B};">'
+                        f'🏦 {m["cb_note"]}</div>',
+                        unsafe_allow_html=True,
+                    )
 
 
 def render_commodities(prices, analysis):
-    comms_ai = {c["n"]:c for c in (analysis.get("comms") or [])} if analysis else {}
-    SYM_MAP = [("GC=F","Gold","XAU"),("CL=F","Crude Oil","WTI"),
-               ("SI=F","Silver","XAG"),("HG=F","Copper","HG"),("NG=F","Natural Gas","NG")]
-    sec_hdr("02","Commodities","Live prices · AI outlook")
+    comms_ai = {c["name"]: c for c in (analysis.get("commodities") or [])} if analysis else {}
+    SYM_MAP = [
+        ("Gold",        "Gold",   "XAU", "$/oz"),
+        ("Crude",       "Crude Oil","WTI","$/bbl"),
+        ("Silver",      "Silver",  "XAG","$/oz"),
+        ("Copper",      "Copper",  "HG", "$/lb"),
+        ("NatGas",      "Natural Gas","NG","$/MMBtu"),
+    ]
+    section_title("02", "Commodities", "Live prices · AI analysis")
+
     cols = st.columns(5)
-    for i,(sym,name,tkr) in enumerate(SYM_MAP):
-        pd_ = prices.get(sym,{}); ai = comms_ai.get(name,{})
-        sc  = sig_c(ai.get("sig","")) if ai.get("sig") else C["mute"]
-        pv  = pd_.get("pct"); up = (pv or 0)>=0
+    for i, (pkey, name, tkr, unit) in enumerate(SYM_MAP):
+        pd_ = prices.get(pkey, {})
+        ai  = comms_ai.get(name, {})
+        sc  = sig_color(ai.get("signal","")) if ai.get("signal") else MUT
+
         with cols[i]:
-            md(f'<div style="height:3px;background:{sc};border-radius:2px;margin-bottom:9px;"></div>')
-            md(f'<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;">'
-               f'<div><div style="font-size:15px;font-weight:800;color:{C["ink"]};">{name}</div>'
-               f'<div style="font-family:monospace;font-size:9px;color:{C["mute"]};'
-               f'letter-spacing:1px;margin-top:2px;">{tkr}</div></div>'
-               + (small_badge(sc, ai["sig"].upper()) if ai.get("sig") else "")
-               + '</div>')
-            if pd_.get("price"):
-                pcc = C["green"] if up else C["red"]
-                arrow = "▲" if up else "▼"
-                md(f'<div style="background:{C["bg"]};border:1px solid {C["bord"]};'
-                   f'border-radius:6px;padding:7px 9px;margin-bottom:5px;">'
-                   f'<div style="font-family:monospace;font-size:18px;font-weight:700;'
-                   f'color:{C["ink"]};">{fmt(pd_["price"])}'
-                   + (f'<span style="font-size:12px;font-weight:700;color:{pcc};margin-left:7px;">'
-                      f'{arrow} {("+" if up else "")}{pv:.2f}%</span>' if pv is not None else "")
-                   + '</div>'
-                   + (f'<div style="font-family:monospace;font-size:9.5px;color:{C["mute"]};">'
-                      f'prev {fmt(pd_["prev"])}</div>' if pd_.get("prev") else "")
-                   + '</div>')
-            if ai.get("sup") or ai.get("res"):
-                md(f'<div style="display:flex;gap:10px;background:{C["bg"]};'
-                   f'border:1px solid {C["bord"]};border-radius:5px;padding:6px 8px;margin-bottom:6px;">'
-                   + (f'<div><div style="font-family:monospace;font-size:8px;color:{C["mute"]};'
-                      f'text-transform:uppercase;letter-spacing:.9px;">Supp</div>'
-                      f'<div style="font-family:monospace;font-size:11px;font-weight:700;'
-                      f'color:{C["green"]};">{ai["sup"]}</div></div>' if ai.get("sup") else "")
-                   + (f'<div><div style="font-family:monospace;font-size:8px;color:{C["mute"]};'
-                      f'text-transform:uppercase;letter-spacing:.9px;">Res</div>'
-                      f'<div style="font-family:monospace;font-size:11px;font-weight:700;'
-                      f'color:{C["red"]};">{ai["res"]}</div></div>' if ai.get("res") else "")
-                   + '</div>')
-            if ai.get("out"):
-                st.caption(ai["out"])
+            with st.container(border=True):
+                color_bar(sc)
+
+                # Name + signal badge
+                nr, br = st.columns([3,1])
+                with nr:
+                    st.markdown(
+                        f'<div style="font-size:14px;font-weight:800;color:{INK};">{name}</div>'
+                        f'<div style="font-family:JetBrains Mono,monospace;font-size:8.5px;'
+                        f'color:{MUT};letter-spacing:.8px;">{tkr} · {unit}</div>',
+                        unsafe_allow_html=True,
+                    )
+                with br:
+                    if ai.get("signal"):
+                        mini_badge(ai["signal"].upper(), sc)
+
+                # Price metric
+                if pd_.get("price"):
+                    pv = pd_.get("pct")
+                    pv_str = pct_str(pv) if pv is not None else None
+                    st.metric(
+                        label="",
+                        value=fmt_num(pd_["price"]),
+                        delta=pv_str,
+                        delta_color="normal",
+                    )
+                    if pd_.get("prev"):
+                        st.markdown(
+                            f'<p style="font-family:JetBrains Mono,monospace;font-size:9px;'
+                            f'color:{MUT};margin-top:-4px;">prev {fmt_num(pd_["prev"])}</p>',
+                            unsafe_allow_html=True,
+                        )
+
+                # Support / Resistance
+                if ai.get("support") or ai.get("resistance"):
+                    sc1, sc2 = st.columns(2)
+                    with sc1:
+                        if ai.get("support"):
+                            st.markdown(
+                                f'<p style="font-family:JetBrains Mono,monospace;'
+                                f'font-size:8px;color:{MUT};margin-bottom:1px;">SUPPORT</p>'
+                                f'<p style="font-family:JetBrains Mono,monospace;'
+                                f'font-size:11px;font-weight:700;color:{G};">{ai["support"]}</p>',
+                                unsafe_allow_html=True,
+                            )
+                    with sc2:
+                        if ai.get("resistance"):
+                            st.markdown(
+                                f'<p style="font-family:JetBrains Mono,monospace;'
+                                f'font-size:8px;color:{MUT};margin-bottom:1px;">RESISTANCE</p>'
+                                f'<p style="font-family:JetBrains Mono,monospace;'
+                                f'font-size:11px;font-weight:700;color:{R};">{ai["resistance"]}</p>',
+                                unsafe_allow_html=True,
+                            )
+
+                if hd(ai.get("analysis")):
+                    st.caption(ai["analysis"])
+
+                if hd(ai.get("positioning_note")):
+                    st.info(f"📊 {ai['positioning_note']}")
 
 
 def render_heatmaps(prices):
-    has_us = any(prices.get(s,{}).get("pct") is not None for s in US_SEC)
-    has_in = any(prices.get(s,{}).get("pct") is not None for s in IN_SEC)
+    us_sec = {
+        "Technology":  prices.get("secTech",{}),
+        "Financials":  prices.get("secFin",{}),
+        "Healthcare":  prices.get("secHlth",{}),
+        "Energy":      prices.get("secEnrg",{}),
+        "Materials":   prices.get("secMatl",{}),
+        "Industrials": prices.get("secInds",{}),
+        "Cons. Disc":  prices.get("secCyc",{}),
+        "Cons. Stap":  prices.get("secStpl",{}),
+        "Utilities":   prices.get("secUtil",{}),
+        "Real Estate": prices.get("secRE",{}),
+        "Comm. Svc":   prices.get("secComm",{}),
+    }
+    in_sec = {
+        "IT":       prices.get("inSIT",{}),  "Banking": prices.get("inSBnk",{}),
+        "Pharma":   prices.get("inSPhrm",{}),"Auto":    prices.get("inSAut",{}),
+        "FMCG":     prices.get("inSFmcg",{}),"Metal":   prices.get("inSMtl",{}),
+        "Energy":   prices.get("inSEnrg",{}),"Realty":  prices.get("inSRlt",{}),
+        "Infra":    prices.get("inSInf",{}), "Media":   prices.get("inSMed",{}),
+        "PSU Bank": prices.get("inSPSU",{}),
+    }
+    has_us = any(d.get("pct") is not None for d in us_sec.values())
+    has_in = any(d.get("pct") is not None for d in in_sec.values())
     if not has_us and not has_in: return
-    sec_hdr("03","Sector Heatmaps","US + India · vs prior close")
+
+    section_title("03", "Sector Heatmaps", "US + India · vs prior close")
     c1, c2 = st.columns(2)
-    with c1: sector_heatmap(US_SEC, prices, "🇺🇸  US — S&P 500 GICS Sectors")
-    with c2: sector_heatmap(IN_SEC, prices, "🇮🇳  India — NSE Sectoral Indices")
+    with c1:
+        fig = chart_treemap(us_sec, "🇺🇸  US — S&P 500 GICS Sectors")
+        if fig: st.plotly_chart(fig, config={"displayModeBar":False})
+        else:   st.caption("US sector data unavailable")
+    with c2:
+        fig = chart_treemap(in_sec, "🇮🇳  India — NSE Sectoral Indices")
+        if fig: st.plotly_chart(fig, config={"displayModeBar":False})
+        else:   st.caption("India sector data unavailable")
 
 
-def render_banks(analysis):
-    banks = [b for b in (analysis.get("banks") or []) if hd(b.get("rate"))]
-    if not banks: return
-    sec_hdr("04","Central Banks & Inflation","policy rate · CPI · stance · next meeting")
-    ths = ["","Bank","Rate","Prev","Date","CPI","Prev CPI","CPI Date","Stance","Next Mtg"]
-    rows = ""
-    for i,b in enumerate(banks):
-        sc = stance_c(b.get("stance",""))
-        rd = round(float(b["rate"])-float(b["rp"]),2) if hd(b.get("rate")) and hd(b.get("rp")) else None
-        cd = round(float(b["cpi"])-float(b["cpip"]),2) if hd(b.get("cpi")) and hd(b.get("cpip")) else None
-        rows += (
-            f'<tr style="background:{"rgba(255,255,255,.01)" if i%2 else "transparent"};">'
-            f'<td style="padding:9px 10px;border-bottom:1px solid {C["bord"]};">'
-            f'<div style="display:flex;align-items:center;gap:7px;">'
-            f'<span style="font-size:18px;">{b.get("f","")}</span>'
-            f'<span style="font-size:13px;font-weight:700;color:{C["ink"]};font-family:DM Sans,sans-serif;">'
-            f'{b.get("c","")}</span></div></td>'
-            f'<td style="padding:9px 10px;text-align:center;border-bottom:1px solid {C["bord"]};">'
-            f'<span style="font-size:11px;color:{C["mute"]};font-family:monospace;">{b.get("bank","")}</span></td>'
-            f'<td style="padding:9px 10px;text-align:center;border-bottom:1px solid {C["bord"]};">'
-            f'<span style="font-size:16px;font-weight:800;color:{C["ink"]};font-family:monospace;">'
-            f'{b["rate"]+"%"  if hd(b.get("rate")) else "—"}</span></td>'
-            f'<td style="padding:9px 10px;text-align:center;border-bottom:1px solid {C["bord"]};">'
-            f'<div style="display:flex;flex-direction:column;align-items:center;gap:1px;">'
-            f'<span style="font-size:12px;color:{C["body"]};font-family:monospace;">'
-            f'{b["rp"]+"%"  if hd(b.get("rp")) else "—"}</span>'
-            + (f'<span style="font-size:10px;color:{"#2dd4a7" if rd<0 else "#f4516c"};font-family:monospace;font-weight:700;">'
-               f'{("+" if rd>0 else "")}{rd:.2f}pp</span>' if rd is not None and abs(rd)>.001 else "")
-            + f'</div></td>'
-            f'<td style="padding:9px 10px;text-align:center;border-bottom:1px solid {C["bord"]};">'
-            f'<span style="font-size:10px;color:{C["mute"]};font-family:monospace;">'
-            f'{b.get("rd") or "—"}</span></td>'
-            f'<td style="padding:9px 10px;text-align:center;border-bottom:1px solid {C["bord"]};">'
-            f'<div style="display:flex;align-items:center;justify-content:center;gap:4px;">'
-            f'<span style="font-size:14px;font-weight:800;color:{C["ink"]};font-family:monospace;">'
-            f'{b["cpi"]+"%"  if hd(b.get("cpi")) else "—"}</span>'
-            + (f'<span style="font-size:11px;color:{"#2dd4a7" if cd<0 else "#f4516c"};">{"↓" if cd<0 else "↑"}</span>' if cd is not None else "")
-            + f'</div></td>'
-            f'<td style="padding:9px 10px;text-align:center;border-bottom:1px solid {C["bord"]};">'
-            f'<span style="font-size:12px;color:{C["body"]};font-family:monospace;">'
-            f'{b["cpip"]+"%"  if hd(b.get("cpip")) else "—"}</span></td>'
-            f'<td style="padding:9px 10px;text-align:center;border-bottom:1px solid {C["bord"]};">'
-            f'<span style="font-size:10px;color:{C["mute"]};font-family:monospace;">'
-            f'{b.get("cpid") or "—"}</span></td>'
-            f'<td style="padding:9px 10px;text-align:center;border-bottom:1px solid {C["bord"]};">'
-            f'<span style="font-family:monospace;font-size:9.5px;font-weight:700;'
-            f'background:{sc}1a;color:{sc};border:1px solid {sc}35;border-radius:4px;'
-            f'padding:3px 7px;white-space:nowrap;">{stance_l(b.get("stance",""))}</span></td>'
-            f'<td style="padding:9px 10px;text-align:center;border-bottom:1px solid {C["bord"]};">'
-            f'<span style="font-size:10px;color:{C["blue"]};font-family:monospace;font-weight:500;">'
-            f'{b.get("next") or "—"}</span></td></tr>'
-        )
-    th_css = (f"padding:7px 10px;text-align:center;font-size:9px;font-family:monospace;"
-              f"font-weight:700;color:{C['mute']};letter-spacing:1px;text-transform:uppercase;"
-              f"border-bottom:1px solid {C['bord']};background:{C['bg']};white-space:nowrap;")
-    th_row = "".join(f'<th style="{th_css}">{h}</th>' for h in ths)
-    md(f'<div style="background:{C["surf"]};border:1px solid {C["bord"]};'
-       f'border-radius:11px;overflow:hidden;overflow-x:auto;">'
-       f'<table style="width:100%;border-collapse:separate;border-spacing:0;">'
-       f'<thead><tr>{th_row}</tr></thead><tbody>{rows}</tbody></table></div>')
+def render_central_banks(cb: dict):
+    section_title("04", "Central Banks & Inflation",
+                  "Rates + CPI · Source: Trading Economics")
+
+    # Table headers
+    HEADERS = ["","Bank","Rate","Prev Rate","Rate Date","CPI","Prev CPI","CPI Date","Stance","Next Mtg"]
+    th = " | ".join(HEADERS)
+
+    rows = []
+    for key, v in cb.items():
+        sc = stance_color(v.get("stance",""))
+        rd = round(v["rate"]-v["rp"],2) if v.get("rate") and v.get("rp") else None
+        cd = round(v["cpi"]-v["cpip"],2) if v.get("cpi") is not None and v.get("cpip") is not None else None
+        rows.append({
+            "": f"{v['flag']} {key}",
+            "Bank": v["bank"],
+            "Rate": f"{v['rate']:.2f}%",
+            "Prev Rate": f"{v['rp']:.2f}%" + (f" ({'+' if rd>=0 else ''}{rd:.2f}pp)" if rd else ""),
+            "Rate Date": v.get("rd","—"),
+            "CPI": f"{v['cpi']:.1f}%" + ("  ↑" if cd and cd>0 else "  ↓" if cd and cd<0 else ""),
+            "Prev CPI": f"{v['cpip']:.1f}%" if v.get("cpip") is not None else "—",
+            "CPI Date": v.get("cpid","—"),
+            "Stance": stance_label(v.get("stance","")),
+            "Next Mtg": v.get("next","—"),
+        })
+
+    df = pd.DataFrame(rows)
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "": st.column_config.TextColumn(width="small"),
+            "Rate": st.column_config.TextColumn(width="small"),
+            "Stance": st.column_config.TextColumn(width="medium"),
+        }
+    )
 
 
 def render_picks(analysis):
-    picks = [p for p in (analysis.get("picks") or []) if hd(p.get("n"))]
+    picks = [p for p in (analysis.get("picks") or []) if hd(p.get("name"))]
     if not picks: return
-    sec_hdr("05","Top Picks & Trade Ideas",f"{len(picks)} ideas")
+    section_title("05", "Trade Ideas", f"{len(picks)} picks · AI-generated")
+
     cols = st.columns(len(picks))
-    for i,p in enumerate(picks):
-        db, dc, dbd = dir_s(p.get("dir",""))
-        cc = C["green"] if p.get("conv")=="high" else C["amber"] if p.get("conv")=="medium" else C["mute"]
-        dots = "".join(f'<div style="width:6px;height:6px;border-radius:50%;background:'
-                       f'{cc if j<(3 if p.get("conv")=="high" else 2 if p.get("conv")=="medium" else 1) else C["dim"]};"></div>'
-                       for j in range(3))
-        dir_txt = "▲ LONG" if p.get("dir")=="long" else "▼ SHORT" if p.get("dir")=="short" else "◆ NEUTRAL"
-        tf_badge = (f'<span style="font-family:monospace;font-size:9px;color:{C["mute"]};'
-                    f'background:{C["bg"]};border:1px solid {C["bord"]};padding:2px 6px;'
-                    f'border-radius:3px;letter-spacing:.4px;">{p["tf"]}</span>' if hd(p.get("tf")) else "")
+    for i, p in enumerate(picks):
+        dc = dir_color(p.get("direction",""))
+        conv = p.get("conviction","low")
         with cols[i]:
-            md(f'<div style="border-top:3px solid {dc};border:1px solid {C["bord"]};'
-               f'border-top:3px solid {dc};border-radius:0 0 10px 10px;'
-               f'background:{C["surf"]};padding:14px;">'
-               f'<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:7px;">'
-               f'<div style="font-family:\'Instrument Serif\',serif;font-size:18px;'
-               f'color:{C["ink"]};font-weight:400;letter-spacing:-.2px;">{p.get("n","")}</div>'
-               f'<div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;">'
-               + (f'<span style="font-family:monospace;font-size:9px;color:{C["mute"]};'
-                  f'background:{C["bg"]};border:1px solid {C["bord"]};padding:2px 5px;'
-                  f'border-radius:3px;text-transform:uppercase;">{p["reg"]}</span>' if hd(p.get("reg")) else "")
-               + (f'<span style="font-family:monospace;font-size:9px;color:{C["blue"]};'
-                  f'background:rgba(91,141,239,.06);border:1px solid rgba(91,141,239,.2);'
-                  f'padding:2px 5px;border-radius:3px;text-transform:uppercase;">{p["t"]}</span>' if hd(p.get("t")) else "")
-               + f'</div></div>'
-               f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:7px;align-items:center;">'
-               f'<span style="font-family:monospace;font-size:10px;font-weight:700;'
-               f'padding:3px 8px;border-radius:4px;background:{db};color:{dc};'
-               f'border:1px solid {dbd};">{dir_txt}</span>'
-               f'<div style="display:flex;align-items:center;gap:5px;">'
-               f'<div style="display:flex;gap:3px;">{dots}</div>'
-               f'<span style="font-family:monospace;font-size:9px;color:{C["body"]};'
-               f'text-transform:uppercase;font-weight:700;">{p.get("conv","")}</span></div>'
-               f'{tf_badge}</div>'
-               + (f'<div style="font-size:12.5px;font-weight:700;color:{C["ink"]};'
-                  f'margin-bottom:5px;line-height:1.4;">{p["hl"]}</div>' if hd(p.get("hl")) else "")
-               + (f'<div style="font-size:11.5px;color:{C["body"]};line-height:1.65;">{p["thesis"]}</div>' if hd(p.get("thesis")) else "")
-               + '</div>')
+            with st.container(border=True):
+                color_bar(dc)
+                st.markdown(
+                    f'<div style="font-size:15px;font-weight:800;color:{INK};">'
+                    f'{p.get("name","")}</div>'
+                    f'<div style="font-family:JetBrains Mono,monospace;font-size:9px;'
+                    f'color:{MUT};">{p.get("type","").upper()} · {p.get("region","")}</div>',
+                    unsafe_allow_html=True,
+                )
+                # Direction + conviction + timeframe
+                dir_lbl = "▲ LONG" if p.get("direction")=="long" else "▼ SHORT"
+                st.markdown(
+                    f'<div style="margin:6px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">'
+                    f'<span style="font-family:JetBrains Mono,monospace;font-size:10px;'
+                    f'font-weight:700;padding:3px 8px;border-radius:4px;'
+                    f'background:{dc}22;color:{dc};border:1px solid {dc}44;">{dir_lbl}</span>'
+                    f'<span style="font-family:JetBrains Mono,monospace;font-size:9px;color:{MUT};">'
+                    f'{p.get("timeframe","")}</span>'
+                    f'<span style="font-family:JetBrains Mono,monospace;font-size:9px;color:{MUT};">'
+                    f'{conv.upper()} CONV</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                if hd(p.get("headline")):
+                    st.markdown(f"**{p['headline']}**")
+                if hd(p.get("thesis")):
+                    st.markdown(p["thesis"])
+                if hd(p.get("risk")):
+                    st.error(f"⚡ **Risk:** {p['risk']}", icon="⚡")
 
 
 def render_geo(analysis):
-    geo = [g for g in (analysis.get("geo") or []) if hd(g.get("hl"))]
+    geo = [g for g in (analysis.get("geo") or []) if hd(g.get("headline"))]
     if not geo: return
-    sec_hdr("06","Hedge Fund Radar",f"{len(geo)} themes")
+    section_title("06", "Hedge Fund Radar", f"{len(geo)} themes")
+
     cols = st.columns(3)
-    for i,g in enumerate(geo):
-        uc = urg_c(g.get("urg",""))
-        with cols[i%3]:
-            md(f'<div style="background:{C["surf"]};border:1px solid {C["bord"]};'
-               f'border-radius:10px;padding:13px;margin-bottom:10px;">'
-               f'<div style="display:flex;gap:10px;align-items:flex-start;">'
-               f'<div style="flex-shrink:0;width:34px;height:34px;display:flex;align-items:center;'
-               f'justify-content:center;background:{C["bg"]};border:1px solid {C["bord"]};'
-               f'border-radius:7px;font-size:16px;">{g.get("icon","")}</div>'
-               f'<div style="flex:1;min-width:0;">'
-               f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">'
-               f'<span style="font-family:monospace;font-size:9.5px;font-weight:700;'
-               f'letter-spacing:1.2px;color:{C["mute"]};text-transform:uppercase;">{g.get("cat","")}</span>'
-               f'<div style="width:7px;height:7px;border-radius:50%;background:{uc};'
-               f'box-shadow:0 0 6px {uc};"></div></div>'
-               f'<div style="font-size:12.5px;font-weight:700;color:{C["ink"]};'
-               f'margin-bottom:4px;line-height:1.4;">{g.get("hl","")}</div>'
-               + (f'<div style="font-size:11.5px;color:{C["body"]};line-height:1.65;">{g["det"]}</div>'
-                  if hd(g.get("det")) else "")
-               + '</div></div></div>')
+    for i, g in enumerate(geo):
+        uc = urgency_color(g.get("urgency",""))
+        with cols[i % 3]:
+            with st.container(border=True):
+                # Category + urgency dot
+                st.markdown(
+                    f'<div style="display:flex;justify-content:space-between;'
+                    f'align-items:center;margin-bottom:4px;">'
+                    f'<span style="font-family:JetBrains Mono,monospace;font-size:9px;'
+                    f'font-weight:700;letter-spacing:1.2px;color:{MUT};text-transform:uppercase;">'
+                    f'{g.get("icon","")} {g.get("category","")}</span>'
+                    f'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;'
+                    f'background:{uc};box-shadow:0 0 5px {uc};"></span></div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(f"**{g.get('headline','')}**")
+                if hd(g.get("analysis")):
+                    st.markdown(g["analysis"])
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SETUP PAGE  (shown when no API key)
+# SETUP PAGE
 # ─────────────────────────────────────────────────────────────────────────────
-def show_setup():
+
+def render_setup():
     st.markdown("<br>", unsafe_allow_html=True)
-    _, cc, _ = st.columns([1, 2, 1])
-    with cc:
-        md(f'<div style="background:{C["surf"]};border:2px solid rgba(45,212,167,.35);'
-           f'border-radius:14px;padding:36px;">'
-           f'<div style="font-family:\'Instrument Serif\',serif;font-size:50px;color:{C["green"]};'
-           f'font-style:italic;text-align:center;margin-bottom:10px;">α</div>'
-           f'<div style="font-family:\'Instrument Serif\',serif;font-size:22px;color:{C["ink"]};'
-           f'text-align:center;margin-bottom:22px;">One-time setup — 3 steps</div>')
-
-        for n, title, body in [
-            ("1", "Get free Gemini API key",
-             f'Go to <a href="https://aistudio.google.com" target="_blank" '
-             f'style="color:{C["blue"]};font-weight:600;">aistudio.google.com</a> → '
-             f'Sign in → <b style="color:{C["ink"]}">Get API key → Create API key</b>. '
-             f'Free tier: 15 req/min, 1000 req/day.'),
-            ("2", "Open Streamlit Secrets",
-             f'In <b style="color:{C["ink"]}">share.streamlit.io</b> → find your app → '
-             f'click <b style="color:{C["ink"]}">⋮ (3-dot menu) → Settings → Secrets</b>'),
-            ("3", "Paste and Save",
-             f'In the Secrets text box, paste:<br>'
-             f'<code style="background:{C["bg"]};color:{C["green"]};padding:4px 8px;'
-             f'border-radius:4px;font-size:12px;display:block;margin-top:5px;">'
-             f'GEMINI_API_KEY = "AIzaSy...your_key..."</code><br>'
-             f'Click <b style="color:{C["ink"]}">Save</b>. App restarts. Done.')
+    _, col, _ = st.columns([1, 2.5, 1])
+    with col:
+        st.markdown(
+            f'<div style="text-align:center;font-size:3.5rem;margin-bottom:.5rem;">📊</div>'
+            f'<h2 style="text-align:center;color:{INK};font-weight:800;'
+            f'letter-spacing:-.4px;">AlphaTerminal Setup</h2>'
+            f'<p style="text-align:center;color:{BODY};">3 steps · takes 2 minutes · all free</p>',
+            unsafe_allow_html=True,
+        )
+        st.divider()
+        for n, title, detail in [
+            ("1", "Get a free Gemini API key",
+             f'Go to **[aistudio.google.com](https://aistudio.google.com)** → '
+             f'sign in with Google → **Get API key → Create API key** → copy it.  \n'
+             f'Free tier: 1,500 requests/day, 1M tokens/day.'),
+            ("2", "Open Streamlit Cloud Secrets",
+             f'At **[share.streamlit.io](https://share.streamlit.io)** → your app → '
+             f'**⋮ (3-dot menu) → Settings → Secrets**'),
+            ("3", "Add the secret and save",
+             f'Paste this into the Secrets text box and click **Save**:'),
         ]:
-            md(f'<div style="display:flex;gap:12px;margin-bottom:16px;">'
-               f'<div style="background:{C["green"]};color:{C["bg"]};font-family:monospace;'
-               f'font-weight:700;font-size:12px;padding:3px 9px;border-radius:4px;'
-               f'flex-shrink:0;height:fit-content;margin-top:2px;">{n}</div>'
-               f'<div><div style="font-size:14px;font-weight:700;color:{C["ink"]};'
-               f'margin-bottom:4px;">{title}</div>'
-               f'<div style="font-size:12.5px;color:{C["body"]};line-height:1.65;">{body}</div>'
-               f'</div></div>')
+            c1, c2 = st.columns([0.08, 0.92])
+            with c1:
+                st.markdown(
+                    f'<div style="background:{G};color:{BG};font-weight:800;'
+                    f'font-size:13px;padding:3px 8px;border-radius:5px;'
+                    f'text-align:center;margin-top:4px;">{n}</div>',
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                st.markdown(f"**{title}**")
+                st.markdown(detail)
+        st.code('GEMINI_API_KEY = "AIzaSy...your_key_here..."', language="toml")
+        st.success("After saving, the app auto-restarts and the dashboard loads immediately.")
 
-        md(f'<div style="background:rgba(45,212,167,.06);border:1px solid rgba(45,212,167,.18);'
-           f'border-radius:8px;padding:12px;font-size:11.5px;color:{C["body"]};'
-           f'line-height:1.8;margin-top:6px;text-align:center;">'
-           f'Free: <b style="color:{C["green"]};">1000 req/day · 1M tokens/day</b> · '
-           f'Analysis cached daily · Prices from Yahoo Finance · '
-           f'<b style="color:{C["green"]};">Total cost $0</b></div></div>')
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  MAIN
+# MAIN
 # ─────────────────────────────────────────────────────────────────────────────
+
 def main():
     api_key = st.secrets.get("GEMINI_API_KEY", "").strip()
     now_uae = datetime.now(ZoneInfo("Asia/Dubai"))
 
-    # ── HEADER ───────────────────────────────────────────────────────────────
-    h1, h2, h3, h4 = st.columns([2.2, 4, 1.1, 1.1])
+    # ── HEADER ────────────────────────────────────────────────────────────────
+    h1, h2, h3, h4 = st.columns([2, 5, 1, 1])
     with h1:
-        md(f'<div style="display:flex;align-items:center;gap:11px;padding:10px 0 6px 0;">'
-           f'<div style="width:34px;height:34px;border-radius:8px;'
-           f'background:linear-gradient(135deg,{C["green"]},{C["blue"]});'
-           f'display:flex;align-items:center;justify-content:center;'
-           f'font-family:\'Instrument Serif\',serif;font-size:20px;font-style:italic;'
-           f'color:{C["bg"]};box-shadow:0 3px 12px rgba(45,212,167,.2);">α</div>'
-           f'<div><div style="font-family:\'Instrument Serif\',serif;font-size:22px;'
-           f'color:{C["ink"]};letter-spacing:-.4px;line-height:1;">'
-           f'Alpha<i style="font-style:italic;color:{C["green"]};">Terminal</i></div>'
-           f'<div style="font-family:monospace;font-size:9px;color:{C["mute"]};'
-           f'letter-spacing:1.5px;margin-top:1px;">MACRO · COMMODITIES · ALPHA</div>'
-           f'</div></div>')
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:10px;padding:8px 0 4px;">'
+            f'<div style="width:32px;height:32px;border-radius:8px;flex-shrink:0;'
+            f'background:linear-gradient(135deg,{G},{B});'
+            f'display:flex;align-items:center;justify-content:center;'
+            f'font-size:18px;color:{BG};font-weight:900;">α</div>'
+            f'<div><div style="font-size:20px;font-weight:900;color:{INK};letter-spacing:-.4px;">'
+            f'Alpha<span style="color:{G};">Terminal</span></div>'
+            f'<div style="font-family:JetBrains Mono,monospace;font-size:8.5px;'
+            f'color:{MUT};letter-spacing:1.5px;">MACRO · COMMODITIES · ALPHA</div>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
     with h2:
-        md(f'<div style="padding:12px 0 0 0;font-family:monospace;font-size:10px;'
-           f'color:{C["mute"]};letter-spacing:.4px;">'
-           f'{now_uae.strftime("%A, %d %B %Y  %H:%M")} GST &nbsp;·&nbsp; '
-           f'All % changes vs prior trading day close &nbsp;·&nbsp; '
-           f'Prices: Yahoo Finance (15-min) &nbsp;·&nbsp; Analysis: Gemini (daily cache)</div>')
+        st.markdown(
+            f'<div style="padding:10px 0 0;">'
+            f'<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:{MUT};">'
+            f'{now_uae.strftime("%A, %d %B %Y  %H:%M")} GST &nbsp;·&nbsp; '
+            f'All % changes vs prior trading day close &nbsp;·&nbsp; '
+            f'Prices: Yahoo Finance · CB data: Trading Economics · Analysis: Gemini'
+            f'</span></div>',
+            unsafe_allow_html=True,
+        )
     with h3:
-        refresh_prices = st.button("↺ Prices", use_container_width=True)
+        refresh_p = st.button("↺ Prices", use_container_width=True,
+                               help="Refresh live prices (free, zero tokens)")
     with h4:
-        refresh_analysis = st.button("⚡ Analysis", use_container_width=True)
+        refresh_a = st.button("⚡ Analysis", use_container_width=True,
+                               help="Re-run AI analysis (uses ~4K Gemini tokens)")
 
-    st.markdown(f"<hr style='border:none;border-top:1px solid {C['bord']};margin:2px 0 10px 0;'>",
-                unsafe_allow_html=True)
+    st.markdown(
+        f'<hr style="border:none;border-top:1px solid {BD};margin:2px 0 10px 0;">',
+        unsafe_allow_html=True,
+    )
 
-    # ── HANDLE REFRESHES ─────────────────────────────────────────────────────
-    if refresh_prices:
-        st.cache_data.clear()
-        st.session_state.pop("analysis", None)
+    # ── HANDLE BUTTON CLICKS ──────────────────────────────────────────────────
+    if refresh_p:
+        fetch_prices.clear()
+        fetch_trading_economics.clear()
+        fetch_gold_aed_gulfnews.clear()
         st.rerun()
 
-    if refresh_analysis:
-        if CACHE_F.exists():
-            CACHE_F.unlink(missing_ok=True)
-        st.session_state.pop("analysis", None)
+    if refresh_a:
+        fetch_analysis.clear()
         st.rerun()
 
-    # ── GATE: needs API key ───────────────────────────────────────────────────
+    # ── SETUP PAGE IF NO KEY ──────────────────────────────────────────────────
     if not api_key:
-        show_setup()
+        render_setup()
         return
 
-    # ── PRICES (fast, always shown first) ────────────────────────────────────
-    with st.spinner("Fetching live market prices…"):
+    # ── FETCH DATA ───────────────────────────────────────────────────────────
+    with st.spinner("Fetching live market data…"):
         prices = fetch_prices()
+        cb     = fetch_trading_economics()
+        gn     = fetch_gold_aed_gulfnews()  # Gulf News gold rate
 
-    # ── ANALYSIS (file-cached, parallel Gemini fetch) ─────────────────────────
+    # Merge Gulf News gold into prices if available
+    if gn and gn.get("price") and "GoldAED" in prices:
+        prices["GoldAED"]["price_gn"] = gn["price"]
+        prices["GoldAED"]["source"]   = "Gulf News"
+
+    # ── FETCH ANALYSIS (cached 24h) ──────────────────────────────────────────
     analysis = None
+    with st.spinner("Loading AI analysis (Gemini — cached daily, ~30s first load)…"):
+        analysis = fetch_analysis(api_key, TODAY)
 
-    # 1. Check file cache
-    cached = load_cache()
-    if cached:
-        analysis = cached
-        fetched_label = cached.get("_fetched", "cached")
-    else:
-        # 2. Check session state (prevents re-fetching on page interactions)
-        if st.session_state.get("analysis_date") == TODAY and st.session_state.get("analysis"):
-            analysis = st.session_state["analysis"]
-            fetched_label = analysis.get("_fetched","session")
-        else:
-            # 3. Fetch fresh — 4 parallel Gemini calls
-            progress_slot = st.empty()
-            with progress_slot:
-                with st.spinner("🤖 Loading AI analysis — 4 parallel Gemini searches (first load of the day)…"):
-                    analysis = fetch_all_analysis(api_key)
+    # ── STATUS BAR ───────────────────────────────────────────────────────────
+    c1, c2, c3 = st.columns([2, 2, 2])
+    with c1:
+        st.markdown(
+            f'<p style="font-family:JetBrains Mono,monospace;font-size:9.5px;color:{MUT};">'
+            f'● PRICES: {prices.get("_fetched","—")}</p>',
+            unsafe_allow_html=True,
+        )
+    with c2:
+        ai_status = f"✓ ANALYSIS LOADED" if analysis else "⚠ ANALYSIS UNAVAILABLE"
+        ai_col    = G if analysis else A
+        st.markdown(
+            f'<p style="font-family:JetBrains Mono,monospace;font-size:9.5px;color:{ai_col};">'
+            f'{ai_status}</p>',
+            unsafe_allow_html=True,
+        )
+    with c3:
+        te_indicator = "✓ Trading Economics" if any(
+            v.get("rd") for v in cb.values()
+        ) else "⚠ TE fallback (hardcoded)"
+        st.markdown(
+            f'<p style="font-family:JetBrains Mono,monospace;font-size:9.5px;color:{MUT};">'
+            f'{te_indicator}</p>',
+            unsafe_allow_html=True,
+        )
 
-            progress_slot.empty()
-            if analysis:
-                save_cache(analysis)
-                st.session_state["analysis"] = analysis
-                st.session_state["analysis_date"] = TODAY
-            fetched_label = analysis.get("_fetched", "just now") if analysis else "unavailable"
+    if not analysis:
+        st.warning(
+            "AI analysis unavailable. Prices and CB data are still shown. "
+            "Click **⚡ Analysis** to retry. If this persists, check your Gemini API key "
+            "in Streamlit Secrets (Settings → Secrets).",
+            icon="⚠️",
+        )
 
-    # Section status banner
-    if analysis:
-        secs = analysis.get("_sections", {})
-        status_parts = []
-        for k, label in [("macro","Macro"),("comms","Commodities"),("banks","Banks/Picks"),("geo","Radar")]:
-            ok = secs.get(k, True)
-            col = C["green"] if ok else C["amber"]
-            status_parts.append(f'<span style="color:{col};font-weight:700;">{"✓" if ok else "⚠"} {label}</span>')
+    st.divider()
 
-        md(f'<div style="font-family:monospace;font-size:9.5px;color:{C["dim"]};'
-           f'margin-bottom:10px;">● PRICES: {prices.get("_at","—")} &nbsp;·&nbsp; '
-           f'AI: {fetched_label} &nbsp;·&nbsp; '
-           + " &nbsp;·&nbsp; ".join(status_parts)
-           + '</div>')
-    else:
-        md(f'<div style="background:rgba(244,81,108,.05);border:1px solid rgba(244,81,108,.2);'
-           f'border-radius:8px;padding:11px 14px;margin-bottom:12px;font-size:12px;'
-           f'color:{C["body"]};">⚠ AI analysis unavailable — prices and charts are still live. '
-           f'Click <b>⚡ Analysis</b> (top right) to retry.</div>')
-
-    # Fetched-at line
-    md(f'<div style="font-family:monospace;font-size:9px;color:{C["dim"]};'
-       f'margin-bottom:14px;">All % movements are current vs prior trading day regular session close.</div>')
-
-    # ── RENDER ────────────────────────────────────────────────────────────────
-    render_hero(prices, analysis)
+    # ── RENDER DASHBOARD ──────────────────────────────────────────────────────
+    render_hero(prices, analysis, gn)
 
     if analysis:
         render_macro(analysis)
 
     render_commodities(prices, analysis)
     render_heatmaps(prices)
+    render_central_banks(cb)
 
     if analysis:
-        render_banks(analysis)
         render_picks(analysis)
         render_geo(analysis)
 
-    md(f'<div style="padding:14px 0;border-top:1px solid {C["bord"]};margin-top:26px;'
-       f'font-size:9.5px;color:{C["dim"]};font-family:monospace;'
-       f'display:flex;justify-content:space-between;flex-wrap:wrap;gap:5px;">'
-       f'<span>ALPHA TERMINAL · PRICES: YAHOO FINANCE (FREE) · ANALYSIS: GEMINI (FREE TIER)</span>'
-       f'<span>NOT FINANCIAL ADVICE · INFORMATIONAL PURPOSES ONLY</span></div>')
+    # ── FOOTER ───────────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown(
+        f'<p style="font-family:JetBrains Mono,monospace;font-size:9px;color:{BD};'
+        f'text-align:center;padding:8px 0;">'
+        f'ALPHA TERMINAL · PRICES: YAHOO FINANCE · CB DATA: TRADING ECONOMICS · '
+        f'ANALYSIS: GEMINI 2.0 FLASH · NOT FINANCIAL ADVICE</p>',
+        unsafe_allow_html=True,
+    )
 
 
 if __name__ == "__main__":
