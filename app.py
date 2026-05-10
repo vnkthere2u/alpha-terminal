@@ -212,7 +212,7 @@ def run_full_analysis(gemini_key: str, prices: dict, macro: dict, ohlc: dict) ->
     
     try:
         response = client.models.generate_content(
-            model='gemini-1.5-pro',
+            model='gemini-2.5-flash',  # <--- Updated to use Flash
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
