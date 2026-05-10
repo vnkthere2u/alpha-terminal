@@ -1,9 +1,9 @@
 """
-AlphaTerminal — Institutional Macro Dashboard v10 (Complete Build)
+AlphaTerminal — Institutional Macro Dashboard v10 (Updated SDK)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Prices       → yfinance (15-min cache)
 CB rates/CPI → FRED API (Federal Reserve Economic Data - Unbreakable)
-Analysis     → Gemini 1.5 Pro (2M token context for deep reasoning)
+Analysis     → Gemini 1.5 Pro (Using new google-genai SDK)
 UI           → 100% native Streamlit
 """
 
@@ -11,8 +11,6 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
-import requests
-from bs4 import BeautifulSoup
 import json
 import logging
 import warnings
@@ -20,8 +18,11 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict
 import time
+
+# Essential API Integrations
 from fredapi import Fred
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 warnings.filterwarnings("ignore")
@@ -77,7 +78,6 @@ FRED_SERIES = {
 }
 
 # ─── AI SYSTEM PROMPTS (GEMINI 1.5 PRO) ───────────────────────────────────────
-# We instruct Gemini to output the exact JSON structure your UI expects.
 SYSTEM_PROMPT = """You are a senior macro strategist, geopolitical analyst, and hedge fund portfolio manager. 
 Analyze the provided live market data, yield curves, and central bank data. Do not recite numbers; explain the structural shifts and second-order effects.
 You must return a raw JSON object with the following exact structure (no markdown, no code blocks):
@@ -198,15 +198,10 @@ def fetch_fred_macro(api_key: str) -> dict:
             macro_data[country] = {"bank": params["bank"], "flag": params["flag"], "rate": 0, "rp": 0, "cpi": 0, "cpip": 0, "stance": "hold"}
     return macro_data
 
-# ─── AI ENGINE ────────────────────────────────────────────────────────────────
+# ─── AI ENGINE (UPDATED GOOGLE-GENAI SDK) ─────────────────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
 def run_full_analysis(gemini_key: str, prices: dict, macro: dict, ohlc: dict) -> dict:
-    genai.configure(api_key=gemini_key)
-    model = genai.GenerativeModel(
-        model_name='gemini-1.5-pro',
-        system_instruction=SYSTEM_PROMPT,
-        generation_config={"response_mime_type": "application/json", "temperature": 0.2}
-    )
+    client = genai.Client(api_key=gemini_key)
     
     prompt = f"""
     Live Prices & Yields: {json.dumps(prices)}
@@ -216,7 +211,15 @@ def run_full_analysis(gemini_key: str, prices: dict, macro: dict, ohlc: dict) ->
     """
     
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model='gemini-1.5-pro',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                response_mime_type="application/json",
+                temperature=0.2,
+            )
+        )
         return json.loads(response.text)
     except Exception as e:
         st.error(f"AI Generation Failed: {e}")
@@ -371,7 +374,7 @@ def render_commodities(prices, analysis):
             with st.container(border=True):
                 color_bar(sc)
                 st.markdown(f'<b>{name}</b>', unsafe_allow_html=True)
-                if ai.get("signal"): mini_badge(ai["signal"].upper(), sc)
+                if ai.get("signal"): mini_badge(ai.get("signal", "").upper(), sc)
                 if pd_.get("price"): st.metric("", value=fmt_num(pd_["price"]), delta=pct_str(pd_.get("pct")))
                 if hd(ai.get("analysis")): st.caption(ai["analysis"])
 
