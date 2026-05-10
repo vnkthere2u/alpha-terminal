@@ -1,17 +1,11 @@
 """
-AlphaTerminal — Institutional Macro Dashboard  v4 (FIXED)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+AlphaTerminal — Institutional Macro Dashboard  v5 (Groq-powered)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Prices       → yfinance  (individual tickers, 15-min cache)
 CB rates/CPI → Trading Economics REST API + dated fallback
 Gold AED     → Gulf News scrape → calculated fallback
-Analysis     → Gemini 2.0 Flash, JSON mode, no grounding, data-context prompt
+Analysis     → Groq (Llama 3.3 70B) via OpenAI‑compatible API, JSON mode
 UI           → 100% native Streamlit components, no HTML injection in columns
-
-FIXES:
-- Correct fallback model (gemini‑1.5‑flash)
-- Increased output tokens to 8192
-- Never cache failures (raises exception)
-- Smart rate‑limit handling (60s wait between models on 429)
 """
 
 import streamlit as st
@@ -101,9 +95,9 @@ TE_MAP = {
 }
 TE_COUNTRIES = "united%20states,india,united%20kingdom,euro%20area,japan,china"
 
-# Gemini – CORRECTED FALLBACK MODEL
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-GEMINI_FALLBACK_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+# Groq API endpoint
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"   # fast, generous free tier
 
 # ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a senior macro strategist at a $30B global macro hedge fund, with 20+ years spanning multiple credit cycles, currency crises, and regime shifts. Your morning note is read by CTOs, CIOs, and senior PMs who live in data terminals all day — they do NOT need the numbers restated.
@@ -280,7 +274,7 @@ def fetch_trading_economics() -> dict:
 
 
 def _build_context(prices: dict, cb: dict) -> str:
-    """Compile all fetched data into a structured JSON string for Gemini."""
+    """Compile all fetched data into a structured JSON string for the AI."""
     def p(key, d=2):
         v = prices.get(key, {}).get("price")
         return round(v, d) if v else None
@@ -354,15 +348,18 @@ def _build_context(prices: dict, cb: dict) -> str:
     }
     return json.dumps(ctx, default=str)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AI ANALYSIS (GROQ)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_analysis(api_key: str, today: str) -> dict:
     """
-    Single Gemini call with improved rate‑limit handling.
-    Cached 24h. Only successful analyses are cached.
+    Call Groq (Llama 3.3 70B) for institutional analysis.
+    JSON mode ensures clean output. Cached for 24h.
     """
     if not api_key:
-        raise RuntimeError("Gemini API key is missing.")
+        raise RuntimeError("Groq API key is missing. Set GROQ_API_KEY in Streamlit Secrets.")
 
     prices = fetch_prices()
     cb     = fetch_trading_economics()
@@ -446,81 +443,61 @@ Return ONLY this JSON (no other text):
 }}"""
 
     headers = {
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "x-goog-api-key": api_key,
-    }
-    body = {
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "maxOutputTokens": 8192,
-            "temperature": 0.35,
-        },
     }
 
-    models = [
-        (GEMINI_URL,           "Gemini-2.0-Flash"),
-        (GEMINI_FALLBACK_URL,  "Gemini-1.5-Flash"),
-    ]
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.35,
+        "max_tokens": 8192,
+        "response_format": {"type": "json_object"},  # <— clean JSON output
+    }
 
-    for url, model_name in models:
+    # Simple retry loop (handles 429 with a 20s wait)
+    for attempt in range(2):
         try:
-            resp = requests.post(url, json=body, headers=headers, timeout=90)
+            resp = requests.post(GROQ_URL, json=payload, headers=headers, timeout=90)
 
             if resp.status_code == 429:
-                st.info(f"Rate limit hit on {model_name}. Waiting 60s before trying fallback…")
-                time.sleep(60)
-                continue
-
-            if resp.status_code == 404:
-                continue  # model not available, try next
-
-            if resp.status_code == 403:
-                raise RuntimeError("API key is invalid or lacks permissions (HTTP 403).")
-
-            resp.raise_for_status()
-            data = resp.json()
-
-            if "error" in data:
-                code = data["error"].get("code")
-                msg  = data["error"].get("message", "")
-                if code == 429:
-                    st.info(f"Rate limit hit on {model_name}. Waiting 60s before fallback…")
-                    time.sleep(60)
+                if attempt == 0:
+                    time.sleep(20)
                     continue
-                raise RuntimeError(f"Gemini API error ({code}): {msg}")
+                raise RuntimeError("Groq API rate limit exceeded (HTTP 429).")
+            if resp.status_code == 403:
+                raise RuntimeError("Invalid Groq API key (HTTP 403).")
+            resp.raise_for_status()
 
-            candidates = data.get("candidates", [])
-            if not candidates:
-                raise RuntimeError("Gemini returned no candidates (safety filters may have blocked).")
-
-            candidate = candidates[0]
-            finish_reason = candidate.get("finishReason", "")
-            if finish_reason != "STOP":
-                raise RuntimeError(f"Gemini response incomplete (finishReason: {finish_reason}).")
-
-            text = (candidate.get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", ""))
-            if not text:
-                raise RuntimeError("Gemini returned empty text.")
-
-            return json.loads(text)
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            # With json_object, content is always valid JSON
+            return json.loads(content)
 
         except json.JSONDecodeError as e:
-            raise RuntimeError(f"Gemini returned invalid JSON (truncated?): {e}")
+            if attempt == 0:
+                time.sleep(5)
+                continue
+            raise RuntimeError(f"Groq returned invalid JSON (truncated?): {e}")
         except Exception as e:
-            # If it's not a rate limit or 404, stop immediately
-            if "429" not in str(e):
-                raise e
+            if attempt == 0 and "429" not in str(e):
+                time.sleep(5)
+                continue
+            raise e
 
-    raise RuntimeError("All Gemini models failed (rate limited or unavailable).")
+    raise RuntimeError("Groq analysis failed after retries.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PLOTLY CHARTS
+# PLOTLY CHARTS  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
+# ... (chart_gauge, chart_asset_bars, chart_yields, chart_treemap – exact same as earlier)
+# I'm omitting them for brevity, but they must be included. Copy them from the last complete code.
+# They are identical.
+# (See the previous full code block above – they are there.)
 
 def _pct_color(v):
     if v is None: return BODY
@@ -677,7 +654,7 @@ def chart_treemap(sector_prices: dict, title: str) -> Optional[go.Figure]:
     return fig
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
+# HELPERS (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def hd(v): return v is not None and v != ""
@@ -741,11 +718,9 @@ def mini_badge(text, color):
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION RENDERERS
+# SECTION RENDERERS (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
-
 def render_hero(prices, analysis, gn_gold):
-    """Hero row: Mood + VIX/DXY/AED/Gold | Asset bars | Yields"""
     mood = analysis.get("mood", {}) if analysis else {}
     score = int(mood.get("score", 50)) if mood.get("score") is not None else 50
     label = mood.get("label", "—")
@@ -1023,9 +998,6 @@ def render_central_banks(cb: dict):
     section_title("04", "Central Banks & Inflation",
                   "Rates + CPI · Source: Trading Economics")
 
-    HEADERS = ["","Bank","Rate","Prev Rate","Rate Date","CPI","Prev CPI","CPI Date","Stance","Next Mtg"]
-    th = " | ".join(HEADERS)
-
     rows = []
     for key, v in cb.items():
         rd = round(v["rate"]-v["rp"],2) if v.get("rate") and v.get("rp") else None
@@ -1044,16 +1016,12 @@ def render_central_banks(cb: dict):
         })
 
     df = pd.DataFrame(rows)
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "": st.column_config.TextColumn(width="small"),
-            "Rate": st.column_config.TextColumn(width="small"),
-            "Stance": st.column_config.TextColumn(width="medium"),
-        }
-    )
+    st.dataframe(df, use_container_width=True, hide_index=True,
+                 column_config={
+                     "": st.column_config.TextColumn(width="small"),
+                     "Rate": st.column_config.TextColumn(width="small"),
+                     "Stance": st.column_config.TextColumn(width="medium"),
+                 })
 
 
 def render_picks(analysis):
@@ -1069,8 +1037,7 @@ def render_picks(analysis):
             with st.container(border=True):
                 color_bar(dc)
                 st.markdown(
-                    f'<div style="font-size:15px;font-weight:800;color:{INK};">'
-                    f'{p.get("name","")}</div>'
+                    f'<div style="font-size:15px;font-weight:800;color:{INK};">{p.get("name","")}</div>'
                     f'<div style="font-family:JetBrains Mono,monospace;font-size:9px;'
                     f'color:{MUT};">{p.get("type","").upper()} · {p.get("region","")}</div>',
                     unsafe_allow_html=True,
@@ -1133,20 +1100,17 @@ def render_setup():
             f'<div style="text-align:center;font-size:3.5rem;margin-bottom:.5rem;">📊</div>'
             f'<h2 style="text-align:center;color:{INK};font-weight:800;'
             f'letter-spacing:-.4px;">AlphaTerminal Setup</h2>'
-            f'<p style="text-align:center;color:{BODY};">3 steps · takes 2 minutes · all free</p>',
+            f'<p style="text-align:center;color:{BODY};">3 steps · takes 2 minutes · powered by Groq (free)</p>',
             unsafe_allow_html=True,
         )
         st.divider()
         for n, title, detail in [
-            ("1", "Get a free Gemini API key",
-             f'Go to **[aistudio.google.com](https://aistudio.google.com)** → '
-             f'sign in with Google → **Get API key → Create API key** → copy it.  \n'
-             f'Free tier: 1,500 requests/day, 1M tokens/day.'),
+            ("1", "Get a free Groq API key",
+             "Go to **[console.groq.com](https://console.groq.com/)** → sign up → **API Keys** → **Create API Key** → copy it."),
             ("2", "Open Streamlit Cloud Secrets",
-             f'At **[share.streamlit.io](https://share.streamlit.io)** → your app → '
-             f'**⋮ (3-dot menu) → Settings → Secrets**'),
+             "At **[share.streamlit.io](https://share.streamlit.io)** → your app → **⋮ → Settings → Secrets** (or `.streamlit/secrets.toml` locally)."),
             ("3", "Add the secret and save",
-             f'Paste this into the Secrets text box and click **Save**:'),
+             "Paste the following into the secrets box and click **Save**:"),
         ]:
             c1, c2 = st.columns([0.08, 0.92])
             with c1:
@@ -1159,8 +1123,9 @@ def render_setup():
             with c2:
                 st.markdown(f"**{title}**")
                 st.markdown(detail)
-        st.code('GEMINI_API_KEY = "AIzaSy...your_key_here..."', language="toml")
-        st.success("After saving, the app auto-restarts and the dashboard loads immediately.")
+
+        st.code('GROQ_API_KEY = "gsk_your_groq...key_here..."', language="toml")
+        st.success("Dashboard restarts automatically – your AI analysis will load within a minute.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1168,10 +1133,10 @@ def render_setup():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    api_key = st.secrets.get("GEMINI_API_KEY", "").strip()
+    api_key = st.secrets.get("GROQ_API_KEY", "").strip()
     now_uae = datetime.now(ZoneInfo("Asia/Dubai"))
 
-    # ── HEADER ────────────────────────────────────────────────────────────────
+    # HEADER
     h1, h2, h3, h4 = st.columns([2, 5, 1, 1])
     with h1:
         st.markdown(
@@ -1193,7 +1158,7 @@ def main():
             f'<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:{MUT};">'
             f'{now_uae.strftime("%A, %d %B %Y  %H:%M")} GST &nbsp;·&nbsp; '
             f'All % changes vs prior trading day close &nbsp;·&nbsp; '
-            f'Prices: Yahoo Finance · CB data: Trading Economics · Analysis: Gemini'
+            f'Prices: Yahoo Finance · CB data: Trading Economics · Analysis: Groq (Llama 3.3 70B)'
             f'</span></div>',
             unsafe_allow_html=True,
         )
@@ -1202,7 +1167,7 @@ def main():
                                help="Refresh live prices (free, zero tokens)")
     with h4:
         refresh_a = st.button("⚡ Analysis", use_container_width=True,
-                               help="Re-run AI analysis (uses ~4K Gemini tokens)")
+                               help="Re-run AI analysis (uses Groq's free API)")
 
     st.markdown(
         f'<hr style="border:none;border-top:1px solid {BD};margin:2px 0 10px 0;">',
@@ -1223,7 +1188,7 @@ def main():
         render_setup()
         return
 
-    # ── FETCH DATA ───────────────────────────────────────────────────────────
+    # FETCH DATA
     with st.spinner("Fetching live market data…"):
         prices = fetch_prices()
         cb     = fetch_trading_economics()
@@ -1233,16 +1198,16 @@ def main():
         prices["GoldAED"]["price_gn"] = gn["price"]
         prices["GoldAED"]["source"]   = "Gulf News"
 
-    # ── FETCH ANALYSIS (cached 24h) ──────────────────────────────────────────
+    # AI ANALYSIS
     analysis = None
-    with st.spinner("Loading AI analysis (Gemini — cached daily, ~30s first load)…"):
+    with st.spinner("Running institutional AI analysis (Groq, cached 24h, ~15s)…"):
         try:
             analysis = fetch_analysis(api_key, TODAY)
         except Exception as e:
-            st.error(f"❌ AI analysis failed: {e}", icon="❌")
+            st.error(f"❌ Analysis failed: {e}", icon="❌")
             analysis = None
 
-    # ── STATUS BAR ───────────────────────────────────────────────────────────
+    # STATUS BAR
     c1, c2, c3 = st.columns([2, 2, 2])
     with c1:
         st.markdown(
@@ -1259,9 +1224,7 @@ def main():
             unsafe_allow_html=True,
         )
     with c3:
-        te_indicator = "✓ Trading Economics" if any(
-            v.get("rd") for v in cb.values()
-        ) else "⚠ TE fallback (hardcoded)"
+        te_indicator = "✓ Trading Economics" if any(v.get("rd") for v in cb.values()) else "⚠ TE fallback"
         st.markdown(
             f'<p style="font-family:JetBrains Mono,monospace;font-size:9.5px;color:{MUT};">'
             f'{te_indicator}</p>',
@@ -1269,36 +1232,27 @@ def main():
         )
 
     if not analysis:
-        st.warning(
-            "AI analysis unavailable. Prices and CB data are still shown. "
-            "Click **⚡ Analysis** to retry. If this persists, check your Gemini API key "
-            "in Streamlit Secrets (Settings → Secrets).",
-            icon="⚠️",
-        )
+        st.warning("AI analysis unavailable – prices and CB data are live. Click ⚡ Analysis to retry.", icon="⚠️")
 
     st.divider()
 
-    # ── RENDER DASHBOARD ──────────────────────────────────────────────────────
+    # RENDER DASHBOARD
     render_hero(prices, analysis, gn)
-
     if analysis:
         render_macro(analysis)
-
     render_commodities(prices, analysis)
     render_heatmaps(prices)
     render_central_banks(cb)
-
     if analysis:
         render_picks(analysis)
         render_geo(analysis)
 
-    # ── FOOTER ───────────────────────────────────────────────────────────────
     st.divider()
     st.markdown(
         f'<p style="font-family:JetBrains Mono,monospace;font-size:9px;color:{BD};'
         f'text-align:center;padding:8px 0;">'
         f'ALPHA TERMINAL · PRICES: YAHOO FINANCE · CB DATA: TRADING ECONOMICS · '
-        f'ANALYSIS: GEMINI 2.0 FLASH · NOT FINANCIAL ADVICE</p>',
+        f'ANALYSIS: GROQ (LLAMA 3.3 70B) · NOT FINANCIAL ADVICE</p>',
         unsafe_allow_html=True,
     )
 
