@@ -7,8 +7,11 @@ Gold AED     → Gulf News scrape → calculated fallback
 Analysis     → Gemini 2.0 Flash, JSON mode, no grounding, data-context prompt
 UI           → 100% native Streamlit components, no HTML injection in columns
 
-FIXED: Gemini fallback model corrected, output tokens increased, 
-       no caching of failures; raises exception so cache stays clean.
+FIXES:
+- Correct fallback model (gemini‑1.5‑flash)
+- Increased output tokens to 8192
+- Never cache failures (raises exception)
+- Smart rate‑limit handling (60s wait between models on 429)
 """
 
 import streamlit as st
@@ -24,6 +27,7 @@ import warnings
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from typing import Optional
+import time
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("peewee").setLevel(logging.CRITICAL)
@@ -354,13 +358,11 @@ def _build_context(prices: dict, cb: dict) -> str:
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_analysis(api_key: str, today: str) -> dict:
     """
-    Single Gemini call. JSON mode via responseMimeType = guaranteed clean JSON.
-    No grounding. Full data context passed in prompt.
-    Cached 24h by (api_key, today). Only successful dicts are cached.
-    Raises RuntimeError on failure → cache stays clean, retry next time.
+    Single Gemini call with improved rate‑limit handling.
+    Cached 24h. Only successful analyses are cached.
     """
     if not api_key:
-        raise RuntimeError("Gemini API key is missing. Set GEMINI_API_KEY in Streamlit Secrets.")
+        raise RuntimeError("Gemini API key is missing.")
 
     prices = fetch_prices()
     cb     = fetch_trading_economics()
@@ -457,70 +459,68 @@ Return ONLY this JSON (no other text):
         },
     }
 
-    last_error = None
-    for url in [GEMINI_URL, GEMINI_FALLBACK_URL]:
-        for attempt in range(2):
-            try:
-                resp = requests.post(url, json=body, headers=headers, timeout=90)
-                if resp.status_code == 404:
-                    break  # model not found, try fallback
-                if resp.status_code == 429:
-                    if attempt == 0:
-                        import time; time.sleep(20)
-                        continue
-                    raise RuntimeError("Gemini API rate limit exceeded (HTTP 429).")
-                if resp.status_code == 403:
-                    raise RuntimeError("API key is invalid or lacks permissions (HTTP 403).")
-                resp.raise_for_status()
+    models = [
+        (GEMINI_URL,           "Gemini-2.0-Flash"),
+        (GEMINI_FALLBACK_URL,  "Gemini-1.5-Flash"),
+    ]
 
-                data = resp.json()
-                if "error" in data:
-                    code = data["error"].get("code")
-                    msg  = data["error"].get("message", "")
-                    if code == 429:
-                        if attempt == 0:
-                            import time; time.sleep(20)
-                            continue
-                        raise RuntimeError(f"Gemini API rate limit error: {msg}")
-                    raise RuntimeError(f"Gemini API error ({code}): {msg}")
+    for url, model_name in models:
+        try:
+            resp = requests.post(url, json=body, headers=headers, timeout=90)
 
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    raise RuntimeError("Gemini returned no candidates (likely blocked by safety filters).")
+            if resp.status_code == 429:
+                st.info(f"Rate limit hit on {model_name}. Waiting 60s before trying fallback…")
+                time.sleep(60)
+                continue
 
-                candidate = candidates[0]
-                finish_reason = candidate.get("finishReason", "")
-                if finish_reason != "STOP":
-                    raise RuntimeError(f"Gemini response incomplete (finishReason: {finish_reason}). Output may be truncated or blocked.")
+            if resp.status_code == 404:
+                continue  # model not available, try next
 
-                text = (candidate
-                        .get("content", {})
-                        .get("parts", [{}])[0]
-                        .get("text", ""))
-                if not text:
-                    raise RuntimeError("Gemini returned empty text despite a STOP finish reason.")
+            if resp.status_code == 403:
+                raise RuntimeError("API key is invalid or lacks permissions (HTTP 403).")
 
-                return json.loads(text)
+            resp.raise_for_status()
+            data = resp.json()
 
-            except json.JSONDecodeError as e:
-                raise RuntimeError(f"Gemini returned invalid JSON (probably truncated). Try refreshing. Details: {e}")
-            except Exception as e:
-                last_error = e
-                if attempt == 0:
-                    time.sleep(5)
+            if "error" in data:
+                code = data["error"].get("code")
+                msg  = data["error"].get("message", "")
+                if code == 429:
+                    st.info(f"Rate limit hit on {model_name}. Waiting 60s before fallback…")
+                    time.sleep(60)
                     continue
-                break
-        # fallthrough to next model if this one failed both attempts
-        last_error = RuntimeError(f"All attempts failed for model. Last error: {last_error}")
+                raise RuntimeError(f"Gemini API error ({code}): {msg}")
 
-    raise last_error or RuntimeError("Gemini analysis could not be completed – no models succeeded.")
+            candidates = data.get("candidates", [])
+            if not candidates:
+                raise RuntimeError("Gemini returned no candidates (safety filters may have blocked).")
+
+            candidate = candidates[0]
+            finish_reason = candidate.get("finishReason", "")
+            if finish_reason != "STOP":
+                raise RuntimeError(f"Gemini response incomplete (finishReason: {finish_reason}).")
+
+            text = (candidate.get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", ""))
+            if not text:
+                raise RuntimeError("Gemini returned empty text.")
+
+            return json.loads(text)
+
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Gemini returned invalid JSON (truncated?): {e}")
+        except Exception as e:
+            # If it's not a rate limit or 404, stop immediately
+            if "429" not in str(e):
+                raise e
+
+    raise RuntimeError("All Gemini models failed (rate limited or unavailable).")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PLOTLY CHARTS  (same as original, omitted for brevity)
+# PLOTLY CHARTS
 # ─────────────────────────────────────────────────────────────────────────────
-# ... (all chart functions unchanged: chart_gauge, chart_asset_bars, chart_yields, chart_treemap)
-# They are identical to the original version, so I'll just include them here compactly.
 
 def _pct_color(v):
     if v is None: return BODY
@@ -601,11 +601,10 @@ def chart_yields(prices: dict) -> go.Figure:
         ("🇯🇵 Japan",   "JP10Y",  None),
     ]
     lbls, y10, y2, hover10 = [], [], [], []
-    max_v = 0
     for lbl, sym10, sym2 in YIELD_ROWS:
         d10 = prices.get(sym10, {})
         if not d10.get("price"): continue
-        v10 = round(d10["price"], 2); max_v = max(max_v, v10)
+        v10 = round(d10["price"], 2)
         d2  = prices.get(sym2, {}) if sym2 else {}
         v2  = round(d2["price"], 2) if d2.get("price") else None
         lbls.append(lbl); y10.append(v10); y2.append(v2)
@@ -711,16 +710,6 @@ def urgency_color(u):
 def dir_color(d):
     return G if d == "long" else R
 
-def conv_dots(level):
-    n = {"high":3,"medium":2,"low":1}.get(level,1)
-    c = {"high":G,"medium":A,"low":MUT}.get(level,MUT)
-    dots = "".join(
-        f'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;'
-        f'background:{""+c if i<n else BD};margin-right:2px;"></span>'
-        for i in range(3)
-    )
-    return dots
-
 def section_title(n, title, sub=""):
     st.markdown(
         f'<div style="display:flex;align-items:baseline;gap:10px;'
@@ -752,7 +741,7 @@ def mini_badge(text, color):
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION RENDERERS (unchanged, included for completeness)
+# SECTION RENDERERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def render_hero(prices, analysis, gn_gold):
@@ -1039,7 +1028,6 @@ def render_central_banks(cb: dict):
 
     rows = []
     for key, v in cb.items():
-        sc = stance_color(v.get("stance",""))
         rd = round(v["rate"]-v["rp"],2) if v.get("rate") and v.get("rp") else None
         cd = round(v["cpi"]-v["cpip"],2) if v.get("cpi") is not None and v.get("cpip") is not None else None
         rows.append({
