@@ -321,11 +321,11 @@ GEOPOLITICAL THEMES (search for what hedge funds are watching):
 
 Return the complete JSON with real, searched data. Use empty string for any value you cannot confirm."""
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
     body = {
         "systemInstruction": {"parts": [{"text": GEMINI_SYSTEM}]},
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "tools": [{"googleSearch": {}}],
+        "tools": [{"google_search": {}}],
         "generationConfig": {"maxOutputTokens": 4000, "temperature": 0.1},
     }
     resp = requests.post(url, json=body, timeout=120)
@@ -389,24 +389,29 @@ def dir_style(d: str) -> tuple:
     return "rgba(240,180,41,.1)", C["amber"], "rgba(240,180,41,.22)"
 
 def card(top_color: str, content: str) -> str:
-    return f"""<div style="background:{C['surf']};border:1px solid {C['bord']};border-radius:11px;
-        padding:15px;position:relative;overflow:hidden;margin-bottom:2px;">
-        <div style="position:absolute;top:0;left:0;right:0;height:2px;
-            background:linear-gradient(90deg,{top_color},transparent);border-radius:11px 11px 0 0;"></div>
-        {content}</div>"""
+    """Use border-top instead of position:absolute — Streamlit 1.57 sanitizes position/overflow."""
+    return (
+        f'<div style="background:{C["surf"]};border:1px solid {C["bord"]};'
+        f'border-top:3px solid {top_color};'
+        f'border-radius:0 0 10px 10px;padding:15px;margin-bottom:4px;">'
+        f'{content}</div>'
+    )
 
 def badge(color: str, text: str) -> str:
-    return f"""<span style="display:inline-block;font-family:'JetBrains Mono',monospace;
-        font-size:9.5px;font-weight:700;padding:3px 8px;border-radius:4px;
-        letter-spacing:.5px;text-transform:uppercase;
-        background:{color}20;color:{color};border:1px solid {color}40;">{text}</span>"""
+    return (
+        f'<span style="display:inline-block;font-family:monospace;'
+        f'font-size:9.5px;font-weight:700;padding:3px 8px;border-radius:4px;'
+        f'letter-spacing:.5px;text-transform:uppercase;'
+        f'background:{color}20;color:{color};border:1px solid {color}40;">{text}</span>'
+    )
 
 def tag(text: str, color: str = None) -> str:
     c = color or C["mute"]
-    bg = f"rgba({','.join(str(int(c.lstrip('#')[i:i+2],16)) for i in (0,2,4))},.08)" if color else C["bg"]
-    return f"""<span style="display:inline-block;font-family:'JetBrains Mono',monospace;
-        font-size:9px;color:{c};background:{C['bg']};border:1px solid {C['bord']};
-        padding:2px 6px;border-radius:3px;letter-spacing:.4px;text-transform:uppercase;margin-right:4px;">{text}</span>"""
+    return (
+        f'<span style="display:inline-block;font-family:monospace;'
+        f'font-size:9px;color:{c};background:{C["bg"]};border:1px solid {C["bord"]};'
+        f'padding:2px 6px;border-radius:3px;letter-spacing:.4px;text-transform:uppercase;margin-right:4px;">{text}</span>'
+    )
 
 def section_header(num: str, title: str, sub: str = "") -> str:
     return f"""<div style="display:flex;align-items:baseline;gap:12px;margin:2rem 0 1rem 0;
@@ -580,13 +585,14 @@ def sector_treemap(sector_dict: dict, prices: dict, title: str) -> go.Figure:
     raw_pcts = []
     for sym in sector_dict:
         d = prices.get(sym)
-        raw_pcts.append(d["pct"] if d and d.get("pct") is not None else 0)
+        raw_pcts.append(round(d["pct"], 2) if d and d.get("pct") is not None else 0)
 
     fig = go.Figure(go.Treemap(
         labels=names, parents=[""] * len(names), values=vals,
-        customdata=[[p] for p in raw_pcts],
-        texttemplate="%{label}<br><b>%{customdata[0]:+.2f}%</b>",
-        hovertemplate="<b>%{label}</b><br>Change: %{customdata[0]:+.2f}%<extra></extra>",
+        customdata=[[v] for v in raw_pcts],
+        text=[f"{'+' if v>=0 else ''}{v:.2f}%" for v in raw_pcts],
+        texttemplate="%{label}<br><b>%{text}</b>",
+        hovertemplate="<b>%{label}</b><br>Change: %{text}<extra></extra>",
         marker=dict(
             colors=raw_pcts,
             colorscale=[
@@ -742,60 +748,99 @@ def render_macro(analysis: dict):
 
 def render_commodities(prices: dict, analysis: dict):
     comms_ai = {c["n"]: c for c in (analysis.get("comms") or [])} if analysis else {}
-    sym_map = [("GC=F","Gold"),("CL=F","Crude Oil"),("SI=F","Silver"),
-               ("HG=F","Copper"),("NG=F","Natural Gas")]
-    sym_map_n = {"Gold":"Gold","Crude Oil":"Crude Oil","Silver":"Silver",
-                 "Copper":"Copper","Natural Gas":"Natural Gas"}
-
+    sym_map = [
+        ("GC=F",  "Gold",        "XAU"),
+        ("CL=F",  "Crude Oil",   "WTI"),
+        ("SI=F",  "Silver",      "XAG"),
+        ("HG=F",  "Copper",      "HG"),
+        ("NG=F",  "Natural Gas", "NG"),
+    ]
     st.markdown(section_header("02", "Commodities", "Live prices · AI outlook"), unsafe_allow_html=True)
     cols = st.columns(5)
-    for i, (sym, name) in enumerate(sym_map):
-        pd_  = prices.get(sym, {})
-        ai   = comms_ai.get(name, {})
-        sc   = sig_color(ai.get("sig","")) if ai.get("sig") else C["mute"]
-        pct_v= pd_.get("pct")
-        isup = (pct_v or 0) >= 0
+
+    for i, (sym, name, ticker_label) in enumerate(sym_map):
+        pd_   = prices.get(sym, {})
+        ai    = comms_ai.get(name, {})
+        sig   = ai.get("sig", "")
+        sc    = sig_color(sig) if sig else C["mute"]
+        pct_v = pd_.get("pct")
+        isup  = (pct_v or 0) >= 0
+
         with cols[i]:
-            price_html = ""
+            # ── Colored top strip ──────────────────────────────────────
+            st.markdown(
+                f'<div style="height:3px;background:{sc};border-radius:2px;margin-bottom:10px;"></div>',
+                unsafe_allow_html=True,
+            )
+
+            # ── Name row ───────────────────────────────────────────────
+            name_col, sig_col = st.columns([3, 1])
+            with name_col:
+                st.markdown(
+                    f'<div style="font-size:16px;font-weight:800;color:{C["ink"]};">{name}</div>'
+                    f'<div style="font-family:monospace;font-size:9px;color:{C["mute"]};'
+                    f'letter-spacing:1px;margin-top:2px;">{ticker_label}</div>',
+                    unsafe_allow_html=True,
+                )
+            with sig_col:
+                if sig:
+                    st.markdown(
+                        f'<div style="text-align:right;margin-top:3px;">'
+                        f'{badge(sc, sig.upper())}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            # ── Price box ──────────────────────────────────────────────
             if pd_.get("price"):
                 sign  = "+" if isup else ""
                 arrow = "▲" if isup else "▼"
                 pcc   = C["green"] if isup else C["red"]
-                price_html = f"""
-                <div style="background:{C['bg']};border:1px solid {C['bord']};border-radius:6px;
-                    padding:8px 10px;margin:8px 0;">
-                  <div>
-                    <span style="font-family:'JetBrains Mono',monospace;font-size:19px;
-                        font-weight:700;color:{C['ink']};">{fmt_price(pd_["price"])}</span>
-                    {"" if pct_v is None else f'<span style="font-family:JetBrains Mono,monospace;font-size:12px;font-weight:700;color:{pcc};margin-left:8px;">{arrow} {sign}{pct_v:.2f}%</span>'}
-                  </div>
-                  {"" if not pd_.get("prev") else f'<div style="font-family:JetBrains Mono,monospace;font-size:10px;color:{C["mute"]};margin-top:2px;">prev close {fmt_price(pd_["prev"])}</div>'}
-                </div>"""
+                delta_str = f"{sign}{pct_v:.2f}%" if pct_v is not None else None
 
-            levels_html = ""
+                st.markdown(
+                    f'<div style="background:{C["bg"]};border:1px solid {C["bord"]};'
+                    f'border-radius:6px;padding:8px 10px;margin:8px 0 4px 0;">'
+                    f'<span style="font-family:monospace;font-size:19px;font-weight:700;'
+                    f'color:{C["ink"]};">{fmt_price(pd_["price"])}</span>'
+                    + (f'<span style="font-family:monospace;font-size:12px;font-weight:700;'
+                       f'color:{pcc};margin-left:8px;">{arrow} {delta_str}</span>'
+                       if delta_str else "")
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
+                if pd_.get("prev"):
+                    st.markdown(
+                        f'<div style="font-family:monospace;font-size:9.5px;color:{C["mute"]};'
+                        f'margin-bottom:6px;">prev close {fmt_price(pd_["prev"])}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            # ── Support / Resistance ───────────────────────────────────
             if ai.get("sup") or ai.get("res"):
-                levels_html = f"""
-                <div style="display:flex;gap:9px;background:{C['bg']};border:1px solid {C['bord']};
-                    border-radius:5px;padding:6px 9px;margin-bottom:7px;">
-                  {"" if not ai.get("sup") else f'<div style="flex:1;"><div style="font-family:JetBrains Mono,monospace;font-size:8.5px;color:{C["mute"]};letter-spacing:1px;text-transform:uppercase;margin-bottom:2px;">Support</div><div style="font-family:JetBrains Mono,monospace;font-size:11px;font-weight:700;color:{C["green"]};">{ai["sup"]}</div></div>'}
-                  {"" if not ai.get("res") else f'<div style="flex:1;"><div style="font-family:JetBrains Mono,monospace;font-size:8.5px;color:{C["mute"]};letter-spacing:1px;text-transform:uppercase;margin-bottom:2px;">Resistance</div><div style="font-family:JetBrains Mono,monospace;font-size:11px;font-weight:700;color:{C["red"]};">{ai["res"]}</div></div>'}
-                </div>"""
+                sup_html = (
+                    f'<div><div style="font-family:monospace;font-size:8px;color:{C["mute"]};'
+                    f'text-transform:uppercase;letter-spacing:1px;margin-bottom:1px;">Support</div>'
+                    f'<div style="font-family:monospace;font-size:11px;font-weight:700;'
+                    f'color:{C["green"]};">{ai["sup"]}</div></div>'
+                ) if ai.get("sup") else ""
+                res_html = (
+                    f'<div><div style="font-family:monospace;font-size:8px;color:{C["mute"]};'
+                    f'text-transform:uppercase;letter-spacing:1px;margin-bottom:1px;">Resistance</div>'
+                    f'<div style="font-family:monospace;font-size:11px;font-weight:700;'
+                    f'color:{C["red"]};">{ai["res"]}</div></div>'
+                ) if ai.get("res") else ""
+                st.markdown(
+                    f'<div style="display:flex;gap:12px;background:{C["bg"]};border:1px solid {C["bord"]};'
+                    f'border-radius:5px;padding:7px 9px;margin-bottom:7px;">'
+                    f'{sup_html}{res_html}</div>',
+                    unsafe_allow_html=True,
+                )
 
-            inner = f"""
-              <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;">
-                <div>
-                  <div style="font-family:'Instrument Serif',serif;font-size:18px;color:{C['ink']};
-                      font-weight:400;line-height:1;">{name}</div>
-                  <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:{C['mute']};
-                      margin-top:3px;letter-spacing:1px;">{ai.get("s",sym)}</div>
-                </div>
-                {badge(sc, ai.get("sig","")) if ai.get("sig") else ""}
-              </div>
-              {price_html}
-              {levels_html}
-              {"" if not ai.get("out") else f'<div style="font-size:11.5px;color:{C["body"]};line-height:1.65;">{ai["out"]}</div>'}
-            """
-            st.markdown(card(sc, inner), unsafe_allow_html=True)
+            # ── AI Outlook ─────────────────────────────────────────────
+            if ai.get("out"):
+                st.caption(ai["out"])
+
+            st.markdown("<div style='margin-bottom:4px;'></div>", unsafe_allow_html=True)
 
 
 def render_heatmaps(prices: dict):
