@@ -1,11 +1,11 @@
 """
-AlphaTerminal — Institutional Macro Dashboard  v8 (Split AI Payload)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+AlphaTerminal — Institutional Macro Dashboard  v9 (Fixed Scraper + Section News)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Prices       → yfinance (15‑min cache)
-CB rates/CPI → Trading Economics web scrape (latest)
+CB rates/CPI → Trading Economics web scrape (fixed 6‑col parser)
 Unemployment, GDP → Trading Economics web scrape
-News         → NewsAPI (free tier)
-Analysis     → Groq (Llama 3.3 70B) in 4 parallel JSON calls
+News         → NewsAPI (section‑specific queries)
+Analysis     → Groq (Llama 3.3 70B) in 4 clean JSON calls
 UI           → 100% native Streamlit
 """
 
@@ -91,8 +91,8 @@ TE_MAP = {
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# ─── SYSTEM PROMPTS (concise, to be used in each sub‑call) ───────────────────
-MACRO_SYSTEM = """You are a senior macro strategist at a $30B global hedge fund. Your output must be ONLY the JSON structure specified. No other text.
+# ─── SYSTEM PROMPTS ─────────────────────────────────────────────────────────
+MACRO_SYSTEM = """You are a senior macro strategist. Return ONLY the JSON structure specified. No other text.
 Analyze the provided live macro data, indices, yields, FX, VIX, DXY, yield curve, and central bank fundamentals. For every insight, reference a specific data point from the context. Do not restate numbers; interpret them."""
 
 COMMODITIES_SYSTEM = """You are a commodity strategist. Return ONLY the JSON structure specified. No other text.
@@ -188,32 +188,47 @@ def fetch_gold_aed_gulfnews():
     except: pass
     return None
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TRADING ECONOMICS SCRAPER (FIXED)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _scrape_te_table(indicator_slug: str) -> list:
+    """Correctly parse the 6‑column Trading Economics table."""
     url = f"https://tradingeconomics.com/country-list/{indicator_slug}"
     try:
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        if resp.status_code != 200: return []
+        if resp.status_code != 200:
+            return []
         soup = BeautifulSoup(resp.text, "lxml")
-        table = soup.find("table", class_="table table-hover")
-        if not table: return []
+        table = soup.find("table", class_="table table-hover") or soup.find("table", class_="table")
+        if not table:
+            return []
         rows = table.find_all("tr")[1:]
         data = []
         for row in rows:
             cols = row.find_all("td")
-            if len(cols) < 4: continue
+            if len(cols) < 6:
+                continue
             country = cols[0].get_text(strip=True)
-            last = cols[1].get_text(strip=True)
-            prev = cols[2].get_text(strip=True) if len(cols) > 2 else ""
-            ref_date = cols[3].get_text(strip=True) if len(cols) > 3 else ""
-            data.append({"country": country, "last": last, "previous": prev, "date": ref_date})
+            last    = cols[1].get_text(strip=True)
+            prev    = cols[2].get_text(strip=True)
+            ref     = cols[3].get_text(strip=True)   # 'Reference' column
+            data.append({
+                "country": country,
+                "last": last,
+                "previous": prev,
+                "date": ref,
+            })
         return data
-    except: return []
+    except Exception:
+        return []
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_live_macro() -> dict:
     """Scrape interest rate, inflation, gdp, unemployment from Trading Economics."""
     result = {k: dict(v) for k, v in CB_SCRAPE_FALLBACK.items()}
 
+    # interest rate
     for item in _scrape_te_table("interest-rate"):
         key = TE_MAP.get(item["country"])
         if not key: continue
@@ -223,6 +238,7 @@ def fetch_live_macro() -> dict:
         except: pass
         if item["date"]: result[key]["rd"] = item["date"]
 
+    # inflation
     for item in _scrape_te_table("inflation-rate"):
         key = TE_MAP.get(item["country"])
         if not key: continue
@@ -232,12 +248,14 @@ def fetch_live_macro() -> dict:
         except: pass
         if item["date"]: result[key]["cpid"] = item["date"]
 
+    # gdp growth
     for item in _scrape_te_table("gdp-growth"):
         key = TE_MAP.get(item["country"])
         if not key: continue
         try: result[key]["gdp"] = float(item["last"].replace('%',''))
         except: pass
 
+    # unemployment
     for item in _scrape_te_table("unemployment-rate"):
         key = TE_MAP.get(item["country"])
         if not key: continue
@@ -246,17 +264,51 @@ def fetch_live_macro() -> dict:
 
     return result
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_news_headlines(api_key: str, num: int = 10) -> List[str]:
-    if not api_key: return []
-    url = "https://newsapi.org/v2/top-headlines"
-    params = {"apiKey": api_key, "language": "en", "pageSize": num, "category": "business"}
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION‑SPECIFIC NEWS FEEDS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_news(api_key: str, query: str, category: str, num: int) -> List[str]:
+    """Generic NewsAPI call with a free‑form query."""
+    if not api_key:
+        return []
+    url = "https://newsapi.org/v2/everything"
+    params = {
+        "apiKey": api_key,
+        "q": query,
+        "language": "en",
+        "pageSize": num,
+        "sortBy": "publishedAt",
+    }
     try:
         resp = requests.get(url, params=params, timeout=10)
-        if resp.status_code != 200: return []
+        if resp.status_code != 200:
+            return []
         articles = resp.json().get("articles", [])
-        return [a["title"] for a in articles if a.get("title")][:num]
-    except: return []
+        headlines = [a["title"] for a in articles if a.get("title")]
+        return headlines[:num]
+    except:
+        return []
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_news_for_macro(api_key: str) -> List[str]:
+    return _fetch_news(api_key, "central bank OR interest rate OR inflation OR GDP", "business", 6)
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_news_for_commodities(api_key: str) -> List[str]:
+    return _fetch_news(api_key, "oil OR gold OR copper OR commodity", "business", 6)
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_news_for_geo(api_key: str) -> List[str]:
+    return _fetch_news(api_key, "geopolitic OR conflict OR sanction OR tariff", "general", 6)
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_news_for_trades(api_key: str) -> List[str]:
+    return _fetch_news(api_key, "stock market OR earnings OR sector", "business", 6)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMODITY OHLC (5-day)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_commodity_ohlc() -> dict:
@@ -339,22 +391,22 @@ def _build_mood_macro_context(prices, cb):
     return json.dumps(ctx)
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_mood_and_macro(groq_key: str) -> dict:
+def fetch_mood_and_macro(groq_key: str, news_key: str) -> dict:
     prices = fetch_prices()
     cb = fetch_live_macro()
     ctx = _build_mood_macro_context(prices, cb)
-    prompt = f"""Using the live macro data below, return a JSON with:
+    headlines = fetch_news_for_macro(news_key)
+    prompt = f"""Using the live macro data and central bank headlines, return JSON with:
 - "mood": {{score (0-100), label (Risk-On/Cautious/Risk-Off/Volatile), regime (2-3 words), summary (2-3 sentences on regime, historical parallel, primary risk)}}
 - "macro": array of 5 objects in exact order: US, India, China, Japan, Eurozone. Each: flag, headline (sharp non-obvious), analysis (4-5 sentences linking data to second-order effects, institutional positioning, historical analogue), sentiment (bullish/bearish/neutral), key_signal, contrarian (1-2 sentences), cb_note.
-Data:
-{ctx}"""
+DATA:{ctx}
+HEADLINES:{json.dumps(headlines)}"""
     return _groq_call(MACRO_SYSTEM, prompt, groq_key, max_tokens=3000)
 
 # ─── 2. Commodities ─────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_commodities_analysis(groq_key: str, news_key: str) -> dict:
     ohlc = fetch_commodity_ohlc()
-    # compact OHLC: last 3 days, only H/L/C
     compact = {}
     for name, records in ohlc.items():
         compact[name] = [{"h": round(r["High"],2), "l": round(r["Low"],2), "c": round(r["Close"],2)} for r in records[-3:]]
@@ -366,13 +418,13 @@ def fetch_commodities_analysis(groq_key: str, news_key: str) -> dict:
         "Copper": round(prices.get("Copper",{}).get("price",0),3),
         "NatGas": round(prices.get("NatGas",{}).get("price",0),3),
     }
-    headlines = fetch_news_headlines(news_key)
-    prompt = f"""Commodity data:
-Latest prices: {json.dumps(latest)}
-3-day OHLC (High, Low, Close): {json.dumps(compact)}
-Top headlines: {json.dumps(headlines)}
+    headlines = fetch_news_for_commodities(news_key)
+    prompt = f"""COMMODITY OHLC & HEADLINES:
+OHLC (3-day High/Low/Close):{json.dumps(compact)}
+Prices:{json.dumps(latest)}
+Headlines:{json.dumps(headlines)}
 
-Return a JSON with "commodities": array of 5 objects (Gold, Silver, Crude Oil, Copper, Natural Gas). Each: name, signal (buy/sell/hold/watch), support (from OHLC low), resistance (from OHLC high), analysis (4 sentences: technical + macro driver + cross‑asset + specific catalyst), positioning_note."""
+Return JSON "commodities" array of 5 objects (Gold, Silver, Crude Oil, Copper, Natural Gas). Each: name, signal (buy/sell/hold/watch), support (from OHLC low), resistance (from OHLC high), analysis (4 sentences: technical + macro driver + cross‑asset + specific catalyst), positioning_note."""
     return _groq_call(COMMODITIES_SYSTEM, prompt, groq_key, max_tokens=2500)
 
 # ─── 3. Trade Ideas ─────────────────────────────────────────────────────────
@@ -380,9 +432,8 @@ Return a JSON with "commodities": array of 5 objects (Gold, Silver, Crude Oil, C
 def fetch_trade_ideas(groq_key: str, news_key: str) -> dict:
     prices = fetch_prices()
     cb = fetch_live_macro()
-    headlines = fetch_news_headlines(news_key)
+    headlines = fetch_news_for_trades(news_key)
 
-    # key data points for picks
     def chg(key): v = prices.get(key, {}).get("pct"); return round(v, 2) if v else None
     data = {
         "us_sectors": {
@@ -398,29 +449,26 @@ def fetch_trade_ideas(groq_key: str, news_key: str) -> dict:
         "cb_stance": {k: v["stance"] for k, v in cb.items()},
         "headlines": headlines[:5],
     }
-    prompt = f"""Based on the following data, generate 3-5 actionable trade ideas (stock, sector, ETF, or commodity) in a JSON array "picks". Each pick: type, name (ticker), region (US/India/Global/EM), direction (long/short), conviction (high/medium/low), timeframe (2 weeks/1 month/3 months/6 months), headline (punchy thesis), thesis (4-5 sentences with specific catalyst, entry logic, risk, expected return), risk (invalidating factor).
-Data: {json.dumps(data)}"""
+    prompt = f"""Based on the data and headlines, generate 3-5 trade ideas in a JSON "picks" array. Each pick: type, name (ticker), region, direction, conviction, timeframe, headline, thesis, risk.
+DATA:{json.dumps(data)}"""
     return _groq_call(PICKS_SYSTEM, prompt, groq_key, max_tokens=2000)
 
 # ─── 4. Geopolitical & Fund Radar ───────────────────────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_geo_analysis(groq_key: str, news_key: str) -> dict:
-    headlines = fetch_news_headlines(news_key)
-    prompt = f"""Using these headlines: {json.dumps(headlines)}
-Return a JSON with "geo": array of 4-6 objects. Each: category (e.g., Fed Watch, Geopolitics, Earnings, Crypto, EM), icon (emoji), headline (specific, from news), analysis (4 sentences on market impact, hedge fund positioning, key date/catalyst), urgency (high/medium/low)."""
+    headlines = fetch_news_for_geo(news_key)
+    prompt = f"""From these geopolitical headlines:{json.dumps(headlines)}
+Return JSON "geo" array of 4-6 objects: category (Fed Watch, Geopolitics, Earnings, Crypto, EM, Options), icon, headline, analysis, urgency."""
     return _groq_call(GEO_SYSTEM, prompt, groq_key, max_tokens=2000)
 
 # ─── MERGE ALL ANALYSIS SECTIONS ────────────────────────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_full_analysis(groq_key: str, news_key: str, today: str) -> dict:
-    """Fetch all four analysis sections and merge into final dict."""
-    # Run sections sequentially (or you could use threading if needed)
-    mood_macro = fetch_mood_and_macro(groq_key)
+    mood_macro = fetch_mood_and_macro(groq_key, news_key)
     commodities = fetch_commodities_analysis(groq_key, news_key)
     picks = fetch_trade_ideas(groq_key, news_key)
     geo = fetch_geo_analysis(groq_key, news_key)
 
-    # Merge
     analysis = {}
     analysis.update(mood_macro)
     analysis.update(commodities)
@@ -430,8 +478,6 @@ def fetch_full_analysis(groq_key: str, news_key: str, today: str) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PLOTLY CHARTS, HELPERS, RENDERERS (same as before)
-# (Include the full set from your previous complete code – I'm summarising with
-#  placeholders for compactness; you must include your existing functions.)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _pct_color(v):
@@ -626,7 +672,7 @@ def color_bar(color: str):
 def mini_badge(text, color):
     st.markdown(f'<span style="display:inline-block;font-family:JetBrains Mono,monospace;font-size:9px;font-weight:700;padding:2px 7px;border-radius:3px;letter-spacing:.5px;text-transform:uppercase;background:{color}22;color:{color};border:1px solid {color}44;">{text}</span>', unsafe_allow_html=True)
 
-# ─── RENDERERS (identical to previous versions) ─────────────────────────────
+# ─── RENDERERS ──────────────────────────────────────────────────────────────
 def render_hero(prices, analysis, gn_gold):
     # Hero row: Mood + VIX/DXY/AED/Gold | Asset bars | Yields
     mood = analysis.get("mood", {}) if analysis else {}
@@ -804,7 +850,7 @@ def render_setup():
             with c2: st.markdown(f"**{title}**"); st.markdown(detail)
         st.code('''GROQ_API_KEY = "gsk_your_key"
 NEWSAPI_KEY = "your_key"''', language="toml")
-        st.success("After saving, the dashboard restarts and loads within a minute.")
+        st.success("Dashboard restarts after saving secrets.")
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 def main():
@@ -852,6 +898,7 @@ def main():
     with c2: st.markdown(f'<p style="font-family:JetBrains Mono,monospace;font-size:9.5px;color:{G if analysis else A};">{"✓ ANALYSIS LOADED" if analysis else "⚠ ANALYSIS UNAVAILABLE"}</p>', unsafe_allow_html=True)
     with c3: st.markdown(f'<p style="font-family:JetBrains Mono,monospace;font-size:9.5px;color:{MUT};">{"✓ Live Macro" if any(v.get("rd") for v in cb.values()) else "⚠ TE fallback"}</p>', unsafe_allow_html=True)
     if not analysis: st.warning("AI analysis unavailable – prices and CB data are live. Click ⚡ Analysis to retry.", icon="⚠️")
+
     st.divider()
 
     # RENDER DASHBOARD
@@ -864,7 +911,6 @@ def main():
         render_picks(analysis)
         render_geo(analysis)
     else:
-        # still show data even if analysis missing
         render_commodities(prices, None)
         render_heatmaps(prices)
         render_central_banks(cb)
