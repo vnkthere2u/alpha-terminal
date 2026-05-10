@@ -22,7 +22,7 @@ st.set_page_config(
     page_title="AlphaTerminal · Macro Dashboard",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -36,8 +36,23 @@ html, body, [class*="css"], .stApp { background-color: #08090d !important; font-
 #MainMenu, footer, header, .stDeployButton { visibility: hidden; display: none; }
 .main .block-container { padding-top: 0.5rem; max-width: 1440px; }
 div[data-testid="stSidebar"] { background: #101319 !important; border-right: 1px solid #1d2330; }
-.stButton>button { background: #2dd4a7 !important; color: #08090d !important; font-weight: 700 !important; border: none !important; border-radius: 6px !important; font-family: 'DM Sans', sans-serif !important; }
-.stButton>button:hover { box-shadow: 0 4px 16px rgba(45,212,167,.35) !important; transform: translateY(-1px); }
+.stButton>button {
+    background: #2dd4a7 !important;
+    color: #08090d !important;
+    font-weight: 800 !important;
+    font-size: 13px !important;
+    border: none !important;
+    border-radius: 6px !important;
+    padding: 8px 20px !important;
+    font-family: 'DM Sans', sans-serif !important;
+    letter-spacing: 0.2px !important;
+    box-shadow: 0 2px 12px rgba(45,212,167,.3) !important;
+}
+.stButton>button:hover {
+    background: #3ddbb0 !important;
+    box-shadow: 0 4px 18px rgba(45,212,167,.5) !important;
+    transform: translateY(-1px);
+}
 .stTextInput>div>div>input { background: #101319 !important; color: #eaeef5 !important; border: 1px solid #1d2330 !important; border-radius: 6px !important; font-family: 'JetBrains Mono', monospace !important; }
 .stSpinner > div { border-top-color: #2dd4a7 !important; }
 div[data-testid="metric-container"] { background: #101319; border: 1px solid #1d2330; border-radius: 10px; padding: 12px 14px; }
@@ -872,51 +887,72 @@ def sidebar_setup() -> str | None:
     with st.sidebar:
         st.markdown(f"""
         <div style="font-family:'Instrument Serif',serif;font-size:22px;color:{C['ink']};
-            letter-spacing:-.4px;margin-bottom:4px;">Alpha<i style='color:{C["green"]};
+            letter-spacing:-.4px;margin-bottom:2px;">Alpha<i style='color:{C["green"]};
             font-style:italic;'>Terminal</i></div>
         <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:{C['mute']};
             letter-spacing:1.6px;margin-bottom:20px;">MACRO · COMMODITIES · ALPHA</div>
         """, unsafe_allow_html=True)
 
+        # ── Step 1: Get key ────────────────────────────────────────────────
         st.markdown(f"""
-        <div style="font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:1.2px;
-            color:{C['mute']};text-transform:uppercase;margin-bottom:8px;">Gemini API Key</div>
-        """, unsafe_allow_html=True)
-
-        api_key = st.text_input("Gemini API Key", type="password", label_visibility="collapsed",
-                                placeholder="AIzaSy...",
-                                help="Get a free key at aistudio.google.com")
-
-        st.markdown(f"""
-        <div style="background:rgba(45,212,167,.06);border:1px solid rgba(45,212,167,.18);
-            border-radius:8px;padding:10px 12px;margin-top:12px;">
-          <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:{C['green']};
-              font-weight:700;letter-spacing:1px;margin-bottom:6px;">FREE TIER LIMITS</div>
-          <div style="font-size:11px;color:{C['body']};line-height:1.7;">
-            ● 1,500 requests / day<br>
-            ● 1,000,000 tokens / day<br>
-            ● Analysis cached 24 hours<br>
-            ● Prices refresh every 15 min<br>
-            ● <b style="color:{C['green']}">Effectively zero daily cost</b>
+        <div style="background:rgba(45,212,167,.08);border:1px solid rgba(45,212,167,.25);
+            border-radius:8px;padding:12px 13px;margin-bottom:14px;">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;
+              color:{C['green']};letter-spacing:1px;margin-bottom:8px;">STEP 1 — GET FREE API KEY</div>
+          <div style="font-size:12px;color:{C['body']};line-height:1.7;">
+            1. Go to <a href="https://aistudio.google.com" target="_blank"
+               style="color:{C['blue']};font-weight:600;">aistudio.google.com</a><br>
+            2. Sign in with Google (free)<br>
+            3. Click <b style="color:{C['ink']};">Get API key → Create API key</b><br>
+            4. Copy it and paste below ↓
           </div>
         </div>
-        <div style="margin-top:12px;font-size:10px;color:{C['mute']};line-height:1.6;">
-          Get free key at<br>
-          <a href="https://aistudio.google.com" target="_blank"
-              style="color:{C['blue']};">aistudio.google.com</a>
-        </div>
         """, unsafe_allow_html=True)
+
+        # ── Step 2: Enter key ──────────────────────────────────────────────
+        st.markdown(f"""
+        <div style="font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;
+            color:{C['green']};letter-spacing:1px;margin-bottom:6px;">STEP 2 — PASTE KEY HERE</div>
+        """, unsafe_allow_html=True)
+
+        api_key = st.text_input(
+            "Gemini API Key",
+            type="password",
+            label_visibility="collapsed",
+            placeholder="AIzaSy... (paste your key here)",
+            help="Free key from aistudio.google.com — 1M tokens/day at no cost",
+        )
+
+        if api_key:
+            st.markdown(f"""
+            <div style="background:rgba(45,212,167,.08);border:1px solid rgba(45,212,167,.25);
+                border-radius:6px;padding:8px 10px;margin-top:6px;font-family:'JetBrains Mono',
+                monospace;font-size:10px;color:{C['green']};font-weight:700;">
+                ✓ Key entered — dashboard loading…
+            </div>""", unsafe_allow_html=True)
 
         st.divider()
 
         st.markdown(f"""
-        <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:{C['mute']};
-            letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;">Data Sources</div>
-        <div style="font-size:11px;color:{C['body']};line-height:1.8;">
-          📊 <b>Prices</b> — Yahoo Finance (yfinance)<br>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;
+            color:{C['mute']};letter-spacing:1px;text-transform:uppercase;margin-bottom:10px;">
+            Free Tier Limits</div>
+        <div style="font-size:11px;color:{C['body']};line-height:1.9;">
+          ● <b style="color:{C['green']};">1,500</b> requests / day<br>
+          ● <b style="color:{C['green']};">1,000,000</b> tokens / day<br>
+          ● Analysis cached <b>24 hours</b> (runs once/day)<br>
+          ● Prices refresh every <b>15 min</b> (yfinance)<br>
+          ● <b style="color:{C['green']};">Total daily cost: $0</b>
+        </div>
+        <div style="margin-top:16px;font-family:'JetBrains Mono',monospace;font-size:9px;
+            font-weight:700;color:{C['mute']};letter-spacing:1px;text-transform:uppercase;
+            margin-bottom:10px;">Data Sources</div>
+        <div style="font-size:11px;color:{C['body']};line-height:1.9;">
+          📈 <b>Prices & sectors</b> — Yahoo Finance<br>
           🤖 <b>Analysis</b> — Gemini 1.5 Flash<br>
           🔍 <b>Search</b> — Google Search grounding<br>
-          💰 <b>Total daily cost</b> — <span style="color:{C['green']};">$0</span>
+          🏦 <b>CB rates & CPI</b> — Gemini search<br>
+          💡 <b>Trade ideas</b> — Gemini analysis
         </div>
         """, unsafe_allow_html=True)
 
@@ -958,8 +994,8 @@ def main():
           All % changes vs prior trading day regular session close · Prices: Yahoo Finance (15-min cache) · Analysis: Gemini (24-hr cache)
         </div>""", unsafe_allow_html=True)
     with h3:
-        st.markdown("<div style='padding-top:10px;'>", unsafe_allow_html=True)
-        if st.button("↺  Refresh Prices", use_container_width=True):
+        st.markdown("<div style='padding-top:8px;'>", unsafe_allow_html=True)
+        if st.button("↺  Refresh Prices", use_container_width=True, type="primary"):
             st.cache_data.clear()
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
@@ -971,20 +1007,35 @@ def main():
     if not api_key:
         st.markdown(f"""
         <div style="background:{C['surf']};border:1px solid {C['bord']};border-radius:12px;
-            padding:40px;text-align:center;margin:40px auto;max-width:500px;">
+            padding:40px;text-align:center;margin:40px auto;max-width:520px;">
           <div style="font-family:'Instrument Serif',serif;font-size:52px;color:{C['green']};
               font-style:italic;margin-bottom:12px;">α</div>
           <div style="font-family:'Instrument Serif',serif;font-size:24px;color:{C['ink']};
-              margin-bottom:10px;">Enter your Gemini API key</div>
-          <div style="font-size:13px;color:{C['body']};line-height:1.7;margin-bottom:20px;">
-            Open the sidebar (← arrow top-left) and paste your free Gemini API key.<br>
-            Get one in 60 seconds at
-            <a href="https://aistudio.google.com" target="_blank" style="color:{C['blue']};">aistudio.google.com</a>
+              margin-bottom:10px;">Paste your Gemini API key to begin</div>
+
+          <div style="background:rgba(45,212,167,.08);border:2px solid rgba(45,212,167,.35);
+              border-radius:10px;padding:18px;margin:20px 0;text-align:left;">
+            <div style="font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;
+                color:{C['green']};letter-spacing:1px;margin-bottom:10px;">👈  THE SIDEBAR ON THE LEFT</div>
+            <div style="font-size:13px;color:{C['body']};line-height:1.9;">
+              <b style="color:{C['ink']};">1.</b> Look at the <b style="color:{C['green']};">left panel</b> — it should be open<br>
+              <b style="color:{C['ink']};">2.</b> If not visible, click the <b style="color:{C['green']};">› arrow</b> at the top-left edge<br>
+              <b style="color:{C['ink']};">3.</b> Paste your key in the <b style="color:{C['green']};">STEP 2 field</b><br>
+              <b style="color:{C['ink']};">4.</b> Dashboard loads instantly
+            </div>
           </div>
-          <div style="background:rgba(45,212,167,.06);border:1px solid rgba(45,212,167,.2);
-              border-radius:8px;padding:14px;font-size:12px;color:{C['body']};line-height:1.8;">
-            Free tier: <b style="color:{C['green']};">1,500 requests/day · 1M tokens/day</b><br>
-            Analysis cached 24 hours · Prices refresh every 15 min<br>
+
+          <div style="font-size:13px;color:{C['body']};line-height:1.7;margin-bottom:16px;">
+            No key yet? Get one free at<br>
+            <a href="https://aistudio.google.com" target="_blank"
+                style="color:{C['blue']};font-size:14px;font-weight:600;">aistudio.google.com</a>
+            &nbsp;→ <b>Get API key</b> → <b>Create API key</b>
+          </div>
+
+          <div style="background:rgba(45,212,167,.05);border:1px solid rgba(45,212,167,.15);
+              border-radius:8px;padding:12px;font-size:11.5px;color:{C['body']};line-height:1.8;">
+            Free tier: <b style="color:{C['green']};">1,500 req/day · 1M tokens/day</b><br>
+            Analysis cached 24 hrs · Prices refresh every 15 min<br>
             <b style="color:{C['green']};">Total daily cost: $0</b>
           </div>
         </div>""", unsafe_allow_html=True)
