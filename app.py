@@ -217,134 +217,158 @@ def fetch_prices() -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 #  GEMINI ANALYSIS  (free tier: 1,500 req/day · 1M tokens/day)
 # ─────────────────────────────────────────────────────────────────────────────
-GEMINI_SYSTEM = """You are an elite macro hedge fund analyst with institutional-grade expertise.
-Use Google Search to find REAL current market data and news for today.
-Return ONLY a single valid JSON object — no markdown fences, no preamble, no trailing text.
-Unavailable fields → empty string "". Never invent numbers.
+# ─────────────────────────────────────────────────────────────────────────────
+#  GEMINI ANALYSIS  (free tier: 15 RPM · ~1K req/day · 1M tokens/day)
+# ─────────────────────────────────────────────────────────────────────────────
 
-JSON schema (copy structure exactly, fill with real data):
-{
-  "ts": "ISO-8601 timestamp",
-  "basis": "All % moves are current vs prior trading day regular session close",
-  "mood": {"score":52,"label":"Cautious","sum":"1 sentence market tone","vixComment":"VIX interpretation","dxyComment":"DXY interpretation"},
-  "macro": [
-    {"c":"US",      "f":"🇺🇸","hl":"≤12 word headline","sum":"2-3 sentence institutional analysis","sent":"bullish","km":"key metric e.g. 10Y: 4.52%","cb":"Central bank note or empty"},
-    {"c":"India",   "f":"🇮🇳","hl":"","sum":"","sent":"neutral","km":"","cb":""},
-    {"c":"China",   "f":"🇨🇳","hl":"","sum":"","sent":"bearish","km":"","cb":""},
-    {"c":"Japan",   "f":"🇯🇵","hl":"","sum":"","sent":"neutral","km":"","cb":""},
-    {"c":"Eurozone","f":"🇪🇺","hl":"","sum":"","sent":"neutral","km":"","cb":""}
-  ],
-  "comms": [
-    {"n":"Gold",       "s":"XAU","out":"2-sentence technical+fundamental outlook","sig":"hold","sup":"key support level","res":"key resistance level"},
-    {"n":"Silver",     "s":"XAG","out":"","sig":"buy","sup":"","res":""},
-    {"n":"Copper",     "s":"HG", "out":"","sig":"buy","sup":"","res":""},
-    {"n":"Crude Oil",  "s":"WTI","out":"","sig":"hold","sup":"","res":""},
-    {"n":"Natural Gas","s":"NG", "out":"","sig":"watch","sup":"","res":""}
-  ],
-  "banks": [
-    {"c":"US",   "f":"🇺🇸","bank":"Fed", "rate":"5.50","rp":"5.50","rd":"Mar 2025","cpi":"3.2","cpip":"3.4","cpid":"Apr 2025","next":"Jun 11","stance":"hold"},
-    {"c":"India","f":"🇮🇳","bank":"RBI", "rate":"","rp":"","rd":"","cpi":"","cpip":"","cpid":"","next":"","stance":"hold"},
-    {"c":"UK",   "f":"🇬🇧","bank":"BOE", "rate":"","rp":"","rd":"","cpi":"","cpip":"","cpid":"","next":"","stance":"hold"},
-    {"c":"Euro", "f":"🇪🇺","bank":"ECB", "rate":"","rp":"","rd":"","cpi":"","cpip":"","cpid":"","next":"","stance":"cut"},
-    {"c":"Japan","f":"🇯🇵","bank":"BOJ", "rate":"","rp":"","rd":"","cpi":"","cpip":"","cpid":"","next":"","stance":"hold"},
-    {"c":"China","f":"🇨🇳","bank":"PBOC","rate":"","rp":"","rd":"","cpi":"","cpip":"","cpid":"","next":"","stance":"hold"}
-  ],
-  "picks": [
-    {"t":"etf",      "n":"name","reg":"Global","dir":"long","conv":"high","hl":"≤12 word headline","thesis":"2-3 sentence thesis with catalyst and risk","tf":"3 months"},
-    {"t":"stock",    "n":"",    "reg":"US",    "dir":"long","conv":"high","hl":"","thesis":"","tf":""},
-    {"t":"sector",   "n":"",    "reg":"India", "dir":"long","conv":"medium","hl":"","thesis":"","tf":""},
-    {"t":"commodity","n":"",    "reg":"Global","dir":"long","conv":"medium","hl":"","thesis":"","tf":""},
-    {"t":"etf",      "n":"",    "reg":"EM",    "dir":"short","conv":"low","hl":"","thesis":"","tf":""}
-  ],
-  "geo": [
-    {"cat":"Geopolitics",    "icon":"🌍","hl":"","det":"2-sentence detail with hedge fund angle","urg":"high"},
-    {"cat":"Fed Watch",      "icon":"🏦","hl":"","det":"","urg":"high"},
-    {"cat":"Rates & Bonds",  "icon":"📈","hl":"","det":"","urg":"medium"},
-    {"cat":"Earnings Season","icon":"📊","hl":"","det":"","urg":"medium"},
-    {"cat":"Crypto",         "icon":"₿","hl":"","det":"","urg":"low"},
-    {"cat":"EM Risk",        "icon":"🌏","hl":"","det":"","urg":"medium"}
-  ]
-}
+# Models tried in order — 2.0-flash is stable free tier; 2.5-flash is newer
+GEMINI_MODELS = [
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-preview-04-17",
+    "gemini-1.5-flash-latest",
+]
 
-ENUM RULES:
-label  → "Risk-On"|"Cautious"|"Risk-Off"|"Volatile"
-sent   → "bullish"|"bearish"|"neutral"
-sig    → "buy"|"sell"|"hold"|"watch"
-stance → "hold"|"cut"|"hike"
-dir    → "long"|"short"|"neutral"
-conv   → "high"|"medium"|"low"
-urg    → "high"|"medium"|"low"
-rate/cpi → plain number string without % e.g. "5.50" not "5.50%"
-"""
+# Compact system prompt — same output, fewer tokens
+GEMINI_SYSTEM = """Elite macro hedge fund analyst. Use Google Search for real current data.
+Return ONLY valid compact JSON — no fences, no preamble, no trailing text. Missing values → "".
 
-@st.cache_data(ttl=86400, show_spinner=False)  # 24-hour cache — runs ONCE per day
-def fetch_analysis(api_key: str, today: str) -> dict:
-    """
-    Calls Gemini 1.5 Flash with Google Search grounding.
-    'today' parameter ensures cache refreshes each calendar day.
-    Free tier: 1,500 requests/day, 1,000,000 tokens/day.
-    """
-    user_prompt = f"""Today is {today}. Search Google and get real current data for ALL of the following:
+Output exactly this structure:
+{"ts":"ISO-8601","basis":"All % moves vs prior trading day regular session close",
+"mood":{"score":52,"label":"Cautious","sum":"1 sentence"},
+"macro":[
+  {"c":"US","f":"🇺🇸","hl":"≤12 word headline","sum":"2-3 sentence analysis","sent":"bullish","km":"10Y:4.52%","cb":"CB note or empty"},
+  {"c":"India","f":"🇮🇳","hl":"","sum":"","sent":"neutral","km":"","cb":""},
+  {"c":"China","f":"🇨🇳","hl":"","sum":"","sent":"bearish","km":"","cb":""},
+  {"c":"Japan","f":"🇯🇵","hl":"","sum":"","sent":"neutral","km":"","cb":""},
+  {"c":"Eurozone","f":"🇪🇺","hl":"","sum":"","sent":"neutral","km":"","cb":""}],
+"comms":[
+  {"n":"Gold","s":"XAU","out":"2-sentence outlook","sig":"hold","sup":"$2280","res":"$2400"},
+  {"n":"Silver","s":"XAG","out":"","sig":"buy","sup":"","res":""},
+  {"n":"Copper","s":"HG","out":"","sig":"buy","sup":"","res":""},
+  {"n":"Crude Oil","s":"WTI","out":"","sig":"hold","sup":"","res":""},
+  {"n":"Natural Gas","s":"NG","out":"","sig":"watch","sup":"","res":""}],
+"banks":[
+  {"c":"US","f":"🇺🇸","bank":"Fed","rate":"5.50","rp":"5.50","rd":"Mar 2025","cpi":"3.2","cpip":"3.4","cpid":"Apr 2025","next":"Jun 11","stance":"hold"},
+  {"c":"India","f":"🇮🇳","bank":"RBI","rate":"","rp":"","rd":"","cpi":"","cpip":"","cpid":"","next":"","stance":"hold"},
+  {"c":"UK","f":"🇬🇧","bank":"BOE","rate":"","rp":"","rd":"","cpi":"","cpip":"","cpid":"","next":"","stance":"hold"},
+  {"c":"Euro","f":"🇪🇺","bank":"ECB","rate":"","rp":"","rd":"","cpi":"","cpip":"","cpid":"","next":"","stance":"cut"},
+  {"c":"Japan","f":"🇯🇵","bank":"BOJ","rate":"","rp":"","rd":"","cpi":"","cpip":"","cpid":"","next":"","stance":"hold"},
+  {"c":"China","f":"🇨🇳","bank":"PBOC","rate":"","rp":"","rd":"","cpi":"","cpip":"","cpid":"","next":"","stance":"hold"}],
+"picks":[
+  {"t":"etf","n":"","reg":"Global","dir":"long","conv":"high","hl":"","thesis":"2-3 sentence thesis","tf":"3 months"},
+  {"t":"stock","n":"","reg":"US","dir":"long","conv":"high","hl":"","thesis":"","tf":""},
+  {"t":"sector","n":"","reg":"India","dir":"long","conv":"medium","hl":"","thesis":"","tf":""},
+  {"t":"commodity","n":"","reg":"Global","dir":"long","conv":"medium","hl":"","thesis":"","tf":""},
+  {"t":"etf","n":"","reg":"EM","dir":"short","conv":"low","hl":"","thesis":"","tf":""}],
+"geo":[
+  {"cat":"Geopolitics","icon":"🌍","hl":"","det":"2-sentence hedge fund angle","urg":"high"},
+  {"cat":"Fed Watch","icon":"🏦","hl":"","det":"","urg":"high"},
+  {"cat":"Rates & Bonds","icon":"📈","hl":"","det":"","urg":"medium"},
+  {"cat":"Earnings Season","icon":"📊","hl":"","det":"","urg":"medium"},
+  {"cat":"Crypto","icon":"₿","hl":"","det":"","urg":"low"},
+  {"cat":"EM Risk","icon":"🌏","hl":"","det":"","urg":"medium"}]}
 
-MACRO & POLICY (search for today's news):
-- US: Fed stance, latest CPI/PCE, NFP, yield curve signals, key policy moves
-- India: RBI stance, latest CPI, IIP, FII flows, rupee dynamics
-- China: PBOC policy, PMI prints, property sector, stimulus signals
-- Japan: BOJ stance, yen levels, yield curve control, CPI
-- Eurozone: ECB stance, latest CPI, growth outlook, EUR/USD
+ENUMS: label→Risk-On|Cautious|Risk-Off|Volatile · sent→bullish|bearish|neutral
+sig→buy|sell|hold|watch · stance→hold|cut|hike · dir→long|short|neutral
+conv/urg→high|medium|low · rate/cpi→plain number string no % symbol"""
 
-CENTRAL BANKS (search for latest confirmed data):
-- Exact policy rates: Fed, RBI, BOE, ECB, BOJ, PBOC
-- Latest CPI prints and dates for each country
-- Next meeting dates and market expectations
-- Rate change history (current vs previous rate)
 
-COMMODITIES (search for analyst outlooks):
-- Gold: key technical levels (support/resistance), macro drivers, signal
-- Silver: industrial demand outlook, gold/silver ratio, signal
-- Copper: China demand, supply deficit thesis, signal
-- Crude Oil: OPEC+ stance, demand outlook, technical levels, signal
-- Natural Gas: storage data, seasonal outlook, signal
-
-TRADE IDEAS (generate 5 high-conviction ideas):
-- Include sectors, ETFs, stocks, commodities across US, India, Global
-- Each needs: direction (long/short), conviction level, clear 2-3 sentence thesis
-- Include both bull and bear ideas across different timeframes
-
-GEOPOLITICAL THEMES (search for what hedge funds are watching):
-- Geopolitical risks affecting markets (Middle East, Russia-Ukraine, Taiwan)
-- Fed Watch: rate cut odds, inflation path, dot plot signals
-- Bond market stress signals, duration risk, curve dynamics
-- Earnings season: key beats/misses, guidance, sector read-throughs
-- Crypto: Bitcoin/ETF flows, halving impact, altcoin dynamics
-- EM risks: currency stress, debt dynamics, central bank intervention
-
-Return the complete JSON with real, searched data. Use empty string for any value you cannot confirm."""
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+def _call_gemini(api_key: str, model: str, user_prompt: str) -> dict:
+    """Single Gemini API call. Returns parsed dict or raises."""
+    import time
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={api_key}"
+    )
     body = {
         "systemInstruction": {"parts": [{"text": GEMINI_SYSTEM}]},
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
         "tools": [{"google_search": {}}],
-        "generationConfig": {"maxOutputTokens": 4000, "temperature": 0.1},
+        "generationConfig": {"maxOutputTokens": 3000, "temperature": 0.1},
     }
-    resp = requests.post(url, json=body, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
-    if "error" in data:
-        raise ValueError(data["error"].get("message", "Gemini API error"))
-    candidates = data.get("candidates", [])
-    if not candidates:
-        raise ValueError("No candidates returned by Gemini")
-    parts = candidates[0].get("content", {}).get("parts", [])
-    text = "".join(p.get("text", "") for p in parts)
-    # Strip citation markers like [1], [2] that grounding adds
-    text = re.sub(r'\[\d+\]', '', text)
-    text = text.replace("```json", "").replace("```", "").strip()
-    s, e = text.find("{"), text.rfind("}")
-    if s == -1:
-        raise ValueError("No JSON found in Gemini response")
-    return json.loads(text[s:e+1])
+
+    for attempt in range(3):
+        resp = requests.post(url, json=body, timeout=90)
+
+        # 429 → rate limit: short wait then retry
+        if resp.status_code == 429:
+            if attempt < 2:
+                time.sleep(12 * (attempt + 1))  # 12s, 24s
+                continue
+            raise ValueError("RATE_LIMIT_429")
+
+        # 404 → model not found: caller will try next model
+        if resp.status_code == 404:
+            raise ValueError("MODEL_NOT_FOUND_404")
+
+        resp.raise_for_status()
+        data = resp.json()
+
+        # API-level error object in response body
+        if "error" in data:
+            code = data["error"].get("code", 0)
+            msg  = data["error"].get("message", "Gemini error")
+            if code == 429:
+                if attempt < 2:
+                    time.sleep(12 * (attempt + 1))
+                    continue
+            raise ValueError(f"GEMINI_ERR:{msg}")
+
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise ValueError("No candidates in Gemini response")
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text  = "".join(p.get("text", "") for p in parts if "text" in p)
+        text  = re.sub(r'\[\d+\]', '', text)   # strip grounding citation markers
+        text  = text.replace("```json", "").replace("```", "").strip()
+        s, e  = text.find("{"), text.rfind("}")
+        if s == -1:
+            raise ValueError("No JSON in Gemini response")
+        return json.loads(text[s:e+1])
+
+    raise ValueError("RATE_LIMIT_429")   # exhausted retries
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_analysis(api_key: str, today: str) -> dict:
+    """
+    Tries GEMINI_MODELS in order.  Cached 24 h — runs once per day per deployment.
+    Returns result dict on success, raises on all models failing.
+    """
+    user_prompt = (
+        f"Today: {today}. Search Google for real market data and fill the JSON dashboard.\n"
+        "Search for: (1) US/India/China/Japan/Eurozone macro news today "
+        "(2) Central bank policy rates & latest CPI for Fed/RBI/BOE/ECB/BOJ/PBOC "
+        "(3) Gold/Silver/Copper/Crude Oil/NatGas technical outlook & signals "
+        "(4) 5 high-conviction trade ideas across US/India/Global "
+        "(5) 6 geopolitical/market themes hedge funds are watching. "
+        "Return the complete JSON. Use empty string for anything unverifiable."
+    )
+    last_error = None
+    for model in GEMINI_MODELS:
+        try:
+            return _call_gemini(api_key, model, user_prompt)
+        except ValueError as e:
+            msg = str(e)
+            if "MODEL_NOT_FOUND_404" in msg:
+                continue          # try next model
+            if "RATE_LIMIT_429" in msg:
+                last_error = "rate_limit"
+                continue          # try next model (different quota)
+            last_error = msg
+            continue
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    # All models failed
+    if last_error == "rate_limit":
+        raise RuntimeError(
+            "RATE_LIMIT: Gemini free tier hit (15 req/min, ~1000 req/day). "
+            "Wait a few minutes then click Refresh Analysis."
+        )
+    raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  HELPERS
@@ -1042,9 +1066,28 @@ def render_sidebar():
         """, unsafe_allow_html=True)
 
         st.divider()
-        if st.button("↺  Refresh All Data", use_container_width=True, type="primary"):
+        if st.button("↺  Refresh Prices", use_container_width=True, type="primary"):
             st.cache_data.clear()
+            st.session_state.pop("analysis", None)
+            st.session_state.pop("analysis_date", None)
             st.rerun()
+
+        if st.button("⚡  Refresh Analysis", use_container_width=True):
+            # Clear analysis cache + session so Gemini is called again
+            fetch_analysis.clear()
+            st.session_state.pop("analysis", None)
+            st.session_state.pop("analysis_date", None)
+            st.session_state.pop("analysis_error", None)
+            st.rerun()
+
+        st.markdown(
+            f'<div style="font-family:monospace;font-size:10px;color:{C["mute"]};'
+            f'margin-top:8px;line-height:1.7;">'
+            f'⚡ Gemini free tier limits:<br>'
+            f'15 requests/min · ~1000 req/day<br>'
+            f'If rate limited, wait 1 min then<br>click Refresh Analysis above.</div>',
+            unsafe_allow_html=True,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1158,44 +1201,62 @@ def main():
             prices = {"_fetched_at": datetime.now(ZoneInfo("Asia/Dubai")).strftime("%d %b %Y  %H:%M %Z")}
             st.warning(f"Price fetch issue: {str(e)[:120]}")
 
-    # ── Fetch/cache analysis (Gemini, once/day) ──────────────────────────────
+    # ── Fetch/cache analysis (Gemini, once/day, guarded by session state) ────
     analysis = None
     analysis_error = None
-    with st.spinner("Loading AI analysis (Gemini 1.5 Flash + Google Search)…"):
-        try:
-            analysis = fetch_analysis(api_key, str(date.today()))
-        except requests.exceptions.HTTPError as e:
-            code = e.response.status_code if hasattr(e, "response") and e.response else "?"
-            if code == 400:
-                analysis_error = "Invalid API key — check key in sidebar (it should start with AIzaSy…)"
-            elif code == 429:
-                analysis_error = "Gemini free tier rate limit hit — wait a minute then refresh"
-            else:
-                analysis_error = f"Gemini HTTP {code}: {str(e)[:100]}"
-        except Exception as e:
-            msg = str(e)
-            if "API key" in msg or "apiKey" in msg:
-                analysis_error = "Invalid API key — check key in sidebar (it should start with AIzaSy…)"
-            elif "quota" in msg.lower() or "429" in msg:
-                analysis_error = "Gemini quota exceeded — free tier: 1,500 req/day. Try again tomorrow."
-            elif "No JSON" in msg:
-                analysis_error = "Gemini returned unexpected format. Click Refresh Prices to retry."
-            else:
-                analysis_error = f"Analysis unavailable: {msg[:120]}"
+
+    # Session state guard: if we already fetched (or failed) this session, don't retry
+    if "analysis" not in st.session_state:
+        st.session_state["analysis"] = None
+        st.session_state["analysis_error"] = None
+        st.session_state["analysis_date"] = None
+
+    # Use cached session result if same day
+    if st.session_state.get("analysis_date") == str(date.today()) and st.session_state.get("analysis"):
+        analysis = st.session_state["analysis"]
+    else:
+        with st.spinner("Loading AI analysis — Gemini + Google Search (runs once per day)…"):
+            try:
+                analysis = fetch_analysis(api_key, str(date.today()))
+                st.session_state["analysis"] = analysis
+                st.session_state["analysis_date"] = str(date.today())
+                st.session_state["analysis_error"] = None
+            except RuntimeError as e:
+                analysis_error = str(e)
+                st.session_state["analysis_error"] = analysis_error
+            except Exception as e:
+                analysis_error = str(e)
+                st.session_state["analysis_error"] = analysis_error
+
+    # If session has a prior error and no new result, show the stored error
+    if not analysis and not analysis_error:
+        analysis_error = st.session_state.get("analysis_error")
 
     if analysis_error:
-        st.markdown(f"""
-        <div style="background:rgba(244,81,108,.06);border:1px solid rgba(244,81,108,.25);
-            border-radius:10px;padding:14px 16px;margin-bottom:12px;display:flex;
-            align-items:flex-start;gap:12px;">
-          <span style="font-size:20px;">⚠</span>
-          <div>
-            <div style="font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;
-                color:#f4516c;letter-spacing:1px;margin-bottom:5px;">GEMINI ANALYSIS UNAVAILABLE</div>
-            <div style="font-size:12px;color:#a8b3c5;line-height:1.6;">{analysis_error}</div>
-            <div style="font-size:11px;color:#5a6577;margin-top:5px;">Prices and charts below are still live from Yahoo Finance.</div>
-          </div>
-        </div>""", unsafe_allow_html=True)
+        is_rate_limit = "RATE_LIMIT" in analysis_error or "429" in analysis_error
+        icon = "⏱" if is_rate_limit else "⚠"
+        color = C["amber"] if is_rate_limit else C["red"]
+        border_color = "rgba(240,180,41,.25)" if is_rate_limit else "rgba(244,81,108,.25)"
+        bg_color = "rgba(240,180,41,.04)" if is_rate_limit else "rgba(244,81,108,.04)"
+
+        clean_msg = (
+            "Gemini free tier rate limit hit (15 requests/min). "
+            "Prices & charts below are live. Click 'Refresh Analysis' in the sidebar in a few minutes."
+            if is_rate_limit else analysis_error.replace("All Gemini models failed. Last error: ", "")
+        )
+
+        st.markdown(
+            f'<div style="background:{bg_color};border:1px solid {border_color};'
+            f'border-radius:10px;padding:13px 16px;margin-bottom:12px;display:flex;gap:12px;">'
+            f'<span style="font-size:18px;">{icon}</span>'
+            f'<div>'
+            f'<div style="font-family:monospace;font-size:10px;font-weight:700;'
+            f'color:{color};letter-spacing:1px;margin-bottom:4px;">'
+            f'{"GEMINI RATE LIMITED — PRICES STILL LIVE" if is_rate_limit else "GEMINI ANALYSIS UNAVAILABLE"}</div>'
+            f'<div style="font-size:12px;color:{C["body"]};line-height:1.6;">{clean_msg}</div>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
 
     # Fetched-at info
     if prices.get("_fetched_at"):
