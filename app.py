@@ -15,6 +15,11 @@ from zoneinfo import ZoneInfo
 
 import plotly.graph_objects as go
 
+# Suppress yfinance download warnings from appearing in Streamlit logs
+import logging
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("peewee").setLevel(logging.CRITICAL)
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  PAGE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
@@ -88,10 +93,29 @@ IN_SEC = {
     "^CNXMEDIA":"Media","^CNXPSUBANK":"PSU Bank",
 }
 YIELDS = {
-    "^TNX":("US","🇺🇸","10Y"),"^IRX":("US","🇺🇸","3M"),
-    "IN10YT=RR":("India","🇮🇳","10Y"),"DE10YT=RR":("Germany","🇩🇪","10Y"),
-    "GB10YT=RR":("UK","🇬🇧","10Y"),"JP10YT=RR":("Japan","🇯🇵","10Y"),
-    "CN10YT=RR":("China","🇨🇳","10Y"),
+    "^TNX":    ("US",      "🇺🇸", "10Y"),
+    "^IRX":    ("US",      "🇺🇸", "3M"),
+    "^GDBR10": ("Germany", "🇩🇪", "10Y"),   # Deutsche Bund 10Y
+    "^TMBMKGB-10Y": ("UK","🇬🇧", "10Y"),   # UK Gilt 10Y
+    "^JRGB":   ("Japan",   "🇯🇵", "10Y"),   # JGB 10Y
+    # India & China yields fetched via fallback list below
+}
+# Fallback symbols tried individually if primary fails
+YIELD_FALLBACKS = [
+    ("^GDBR10","^BUND"),           # Germany
+    ("^TMBMKGB-10Y","^GBGB10YT"), # UK
+    ("^JRGB","^TMBMKJP-10Y"),     # Japan
+    ("INDGB10Y=X","IN10YT=RR"),   # India
+    ("CNGB10Y=X","CN10YT=RR"),    # China
+]
+YIELD_FALLBACK_META = {
+    "^BUND":        ("Germany","🇩🇪","10Y"),
+    "^GBGB10YT":    ("UK","🇬🇧","10Y"),
+    "^TMBMKJP-10Y": ("Japan","🇯🇵","10Y"),
+    "INDGB10Y=X":   ("India","🇮🇳","10Y"),
+    "IN10YT=RR":    ("India","🇮🇳","10Y"),
+    "CNGB10Y=X":    ("China","🇨🇳","10Y"),
+    "CN10YT=RR":    ("China","🇨🇳","10Y"),
 }
 AED_PEG = 3.6725
 GRAM_OZ = 31.1035
@@ -106,43 +130,87 @@ C = dict(
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=900, show_spinner=False)   # 15-min cache
 def fetch_prices() -> dict:
-    """Batch-download all prices via yfinance. Completely free, no API key needed."""
-    all_syms = list(CORE) + list(US_SEC) + list(IN_SEC) + list(YIELDS)
+    """
+    Fetch prices via yfinance (free, no API key).
+    - Indices, ETFs, commodities: batch download (fast)
+    - Bond yields + AED/INR: individual fetch (batch fails for these)
+    """
+    import warnings
+    warnings.filterwarnings("ignore")
+
     result: dict = {}
+
+    # ── Tier 1: batch download (indices, ETFs, commodities) ─────────────────
+    # Exclude AED/INR and yields — they fail in batch
+    batch_syms = list(CORE.keys()) + list(US_SEC.keys()) + list(IN_SEC.keys())
+    batch_syms = [s for s in batch_syms if s != "AEDIINR=X"]
     try:
         raw = yf.download(
-            all_syms, period="5d", auto_adjust=True,
+            batch_syms, period="5d", auto_adjust=True,
             progress=False, threads=True, group_by="ticker",
         )
-        if raw.empty:
-            return result
-
-        for sym in all_syms:
-            try:
-                if sym in raw.columns.get_level_values(0):
-                    closes = raw[sym]["Close"].dropna()
-                else:
-                    closes = pd.Series(dtype=float)
-
-                if len(closes) < 1:
+        if not raw.empty:
+            lvl0 = raw.columns.get_level_values(0) if hasattr(raw.columns, "get_level_values") else []
+            for sym in batch_syms:
+                try:
+                    if sym in lvl0:
+                        closes = raw[sym]["Close"].dropna()
+                    elif len(batch_syms) == 1:
+                        closes = raw["Close"].dropna()
+                    else:
+                        continue
+                    if len(closes) < 1:
+                        continue
+                    last = float(closes.iloc[-1])
+                    prev = float(closes.iloc[-2]) if len(closes) >= 2 else None
+                    pct  = ((last - prev) / prev * 100) if prev and prev != 0 else None
+                    result[sym] = {"price": last, "prev": prev, "pct": pct,
+                                   "ts": str(closes.index[-1].date())}
+                except Exception:
                     continue
-                last = float(closes.iloc[-1])
-                prev = float(closes.iloc[-2]) if len(closes) >= 2 else None
-                pct  = ((last - prev) / prev * 100) if prev and prev != 0 else None
-                result[sym] = {"price": last, "prev": prev, "pct": pct,
-                               "ts": str(closes.index[-1].date())}
-            except Exception:
-                continue
-    except Exception as e:
-        result["_error"] = str(e)
+    except Exception:
+        pass   # Silently skip — individual fetches below will cover critical ones
 
-    # Gold in AED/gram (24K) — derived, no extra API needed
+    # ── Tier 2: individual fetches (yields, AED/INR, India/China bonds) ─────
+    individual = (
+        list(YIELDS.keys()) +
+        ["AEDIINR=X"] +
+        [sym for pair in YIELD_FALLBACKS for sym in pair]
+    )
+    # Remove duplicates, skip already-fetched
+    seen_countries = set()
+    for sym in dict.fromkeys(individual):   # preserves order, deduplicates
+        if sym in result:
+            continue
+        meta = YIELDS.get(sym) or YIELD_FALLBACK_META.get(sym)
+        if meta and meta[0] in seen_countries:
+            continue   # Already have a yield for this country
+        try:
+            t = yf.Ticker(sym)
+            hist = t.history(period="5d", auto_adjust=True)
+            if hist.empty:
+                continue
+            closes = hist["Close"].dropna()
+            if len(closes) < 1:
+                continue
+            last = float(closes.iloc[-1])
+            prev = float(closes.iloc[-2]) if len(closes) >= 2 else None
+            pct  = ((last - prev) / prev * 100) if prev and prev != 0 else None
+            result[sym] = {"price": last, "prev": prev, "pct": pct,
+                           "ts": str(closes.index[-1].date())}
+            if meta:
+                seen_countries.add(meta[0])   # Mark country as fetched
+        except Exception:
+            continue
+
+    # ── Gold in AED/gram 24K (derived from Gold USD + fixed peg) ───────────
     if "GC=F" in result and result["GC=F"].get("price"):
         g = result["GC=F"]
         result["GOLD_AED"] = {
             "price": g["price"] / GRAM_OZ * AED_PEG,
             "prev":  (g["prev"]  / GRAM_OZ * AED_PEG) if g.get("prev") else None,
         }
+
     result["_fetched_at"] = datetime.now(ZoneInfo("Asia/Dubai")).strftime("%d %b %Y  %H:%M %Z")
     return result
 
@@ -429,22 +497,31 @@ def asset_bar_chart(prices: dict) -> go.Figure:
     return fig
 
 def yield_bar_chart(prices: dict) -> go.Figure:
-    countries = [
-        ("US","🇺🇸","^TNX","^IRX"),
-        ("India","🇮🇳","IN10YT=RR",None),
-        ("Germany","🇩🇪","DE10YT=RR",None),
-        ("UK","🇬🇧","GB10YT=RR",None),
-        ("Japan","🇯🇵","JP10YT=RR",None),
-        ("China","🇨🇳","CN10YT=RR",None),
+    # Build ordered list: for each country, find the first symbol with data
+    country_order = [
+        ("US",      "🇺🇸", ["^TNX"],           ["^IRX"]),
+        ("Germany", "🇩🇪", ["^GDBR10","^BUND"], []),
+        ("UK",      "🇬🇧", ["^TMBMKGB-10Y","^GBGB10YT"], []),
+        ("Japan",   "🇯🇵", ["^JRGB","^TMBMKJP-10Y"], []),
+        ("India",   "🇮🇳", ["INDGB10Y=X","IN10YT=RR"], []),
+        ("China",   "🇨🇳", ["CNGB10Y=X","CN10YT=RR"], []),
     ]
-    labels, y10_vals, y2_vals = [], [], []
-    for cname, flag, sym10, sym2 in countries:
-        d10 = prices.get(sym10)
-        if d10 and d10.get("price") is not None:
+    labels, y10_vals, y2_vals, prev_vals = [], [], [], []
+    for cname, flag, syms10, syms2 in country_order:
+        d10 = next((prices[s] for s in syms10 if s in prices and prices[s].get("price")), None)
+        d2  = next((prices[s] for s in syms2  if s in prices and prices[s].get("price")), None)
+        if d10:
             labels.append(f"{flag} {cname}")
             y10_vals.append(round(d10["price"], 2))
-            d2 = prices.get(sym2) if sym2 else None
-            y2_vals.append(round(d2["price"], 2) if d2 and d2.get("price") else None)
+            prev_vals.append(round(d10["prev"], 2) if d10.get("prev") else None)
+            y2_vals.append(round(d2["price"], 2) if d2 else None)
+
+    if not labels:
+        fig = go.Figure()
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",
+                          annotations=[dict(text="Yield data loading…", x=0.5, y=0.5,
+                                           font={"color": C["mute"], "size": 13}, showarrow=False)])
+        return fig
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
@@ -562,7 +639,7 @@ def render_hero(prices: dict, analysis: dict):
               margin-bottom:8px;">AI-SCORED · GEMINI + GOOGLE SEARCH</div>
         """, unsafe_allow_html=True)
 
-        st.plotly_chart(mood_gauge(score), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(mood_gauge(score), config={"displayModeBar": False})
 
         st.markdown(f"""
           <div style="text-align:center;margin-top:-10px;">
@@ -613,8 +690,7 @@ def render_hero(prices: dict, analysis: dict):
               margin-bottom:10px;">CURRENT · CHANGE % · PREV CLOSE · SOURCE: YAHOO FINANCE</div>
         """, unsafe_allow_html=True)
         if prices and any(k in prices for k in ["^GSPC","^NSEI","GC=F"]):
-            st.plotly_chart(asset_bar_chart(prices), use_container_width=True,
-                            config={"displayModeBar": False})
+            st.plotly_chart(asset_bar_chart(prices), config={"displayModeBar": False})
         else:
             st.caption("Price data loading…")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -628,11 +704,10 @@ def render_hero(prices: dict, analysis: dict):
           <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:{C['dim']};
               margin-bottom:10px;">SOURCE: YAHOO FINANCE · PURPLE = 10Y · BLUE = 2Y/3M</div>
         """, unsafe_allow_html=True)
-        if prices and any(k in prices for k in ["^TNX","IN10YT=RR"]):
-            st.plotly_chart(yield_bar_chart(prices), use_container_width=True,
-                            config={"displayModeBar": False})
+        if prices and any(k in prices for k in ["^TNX","^GDBR10","^JRGB","INDGB10Y=X"]):
+            st.plotly_chart(yield_bar_chart(prices), config={"displayModeBar": False})
         else:
-            st.caption("Yield data loading…")
+            st.plotly_chart(yield_bar_chart(prices), config={"displayModeBar": False})
         st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -732,10 +807,10 @@ def render_heatmaps(prices: dict):
     c1, c2 = st.columns(2)
     with c1:
         st.plotly_chart(sector_treemap(US_SEC, prices, "🇺🇸  US — S&P 500 GICS Sectors"),
-                        use_container_width=True, config={"displayModeBar": False})
+                        config={"displayModeBar": False})
     with c2:
         st.plotly_chart(sector_treemap(IN_SEC, prices, "🇮🇳  India — NSE Sectoral Indices"),
-                        use_container_width=True, config={"displayModeBar": False})
+                        config={"displayModeBar": False})
 
 
 def render_central_banks(analysis: dict):
@@ -1043,20 +1118,50 @@ def main():
 
     # ── Fetch prices (yfinance, free, always) ────────────────────────────────
     with st.spinner("Fetching live market prices via Yahoo Finance…"):
-        prices = fetch_prices()
+        try:
+            prices = fetch_prices()
+        except Exception as e:
+            prices = {"_fetched_at": datetime.now(ZoneInfo("Asia/Dubai")).strftime("%d %b %Y  %H:%M %Z")}
+            st.warning(f"Price fetch issue: {str(e)[:120]}")
 
     # ── Fetch/cache analysis (Gemini, once/day) ──────────────────────────────
     analysis = None
     analysis_error = None
-    with st.spinner("Loading AI analysis (Gemini 1.5 Flash with Google Search)…"):
+    with st.spinner("Loading AI analysis (Gemini 1.5 Flash + Google Search)…"):
         try:
             analysis = fetch_analysis(api_key, str(date.today()))
+        except requests.exceptions.HTTPError as e:
+            code = e.response.status_code if hasattr(e, "response") and e.response else "?"
+            if code == 400:
+                analysis_error = "Invalid API key — check key in sidebar (it should start with AIzaSy…)"
+            elif code == 429:
+                analysis_error = "Gemini free tier rate limit hit — wait a minute then refresh"
+            else:
+                analysis_error = f"Gemini HTTP {code}: {str(e)[:100]}"
         except Exception as e:
-            analysis_error = str(e)
+            msg = str(e)
+            if "API key" in msg or "apiKey" in msg:
+                analysis_error = "Invalid API key — check key in sidebar (it should start with AIzaSy…)"
+            elif "quota" in msg.lower() or "429" in msg:
+                analysis_error = "Gemini quota exceeded — free tier: 1,500 req/day. Try again tomorrow."
+            elif "No JSON" in msg:
+                analysis_error = "Gemini returned unexpected format. Click Refresh Prices to retry."
+            else:
+                analysis_error = f"Analysis unavailable: {msg[:120]}"
 
     if analysis_error:
-        st.error(f"⚠ Gemini analysis failed: {analysis_error}")
-        st.info("Prices are still shown below from Yahoo Finance. Check your API key in the sidebar.")
+        st.markdown(f"""
+        <div style="background:rgba(244,81,108,.06);border:1px solid rgba(244,81,108,.25);
+            border-radius:10px;padding:14px 16px;margin-bottom:12px;display:flex;
+            align-items:flex-start;gap:12px;">
+          <span style="font-size:20px;">⚠</span>
+          <div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;
+                color:#f4516c;letter-spacing:1px;margin-bottom:5px;">GEMINI ANALYSIS UNAVAILABLE</div>
+            <div style="font-size:12px;color:#a8b3c5;line-height:1.6;">{analysis_error}</div>
+            <div style="font-size:11px;color:#5a6577;margin-top:5px;">Prices and charts below are still live from Yahoo Finance.</div>
+          </div>
+        </div>""", unsafe_allow_html=True)
 
     # Fetched-at info
     if prices.get("_fetched_at"):
