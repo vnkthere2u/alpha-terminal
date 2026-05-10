@@ -958,7 +958,10 @@ def render_geo(analysis: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 #  SIDEBAR  — API key entry
 # ─────────────────────────────────────────────────────────────────────────────
-def sidebar_setup() -> str | None:
+# ─────────────────────────────────────────────────────────────────────────────
+#  SIDEBAR  — info only, API key comes from st.secrets
+# ─────────────────────────────────────────────────────────────────────────────
+def render_sidebar():
     with st.sidebar:
         st.markdown(f"""
         <div style="font-family:'Instrument Serif',serif;font-size:22px;color:{C['ink']};
@@ -966,82 +969,50 @@ def sidebar_setup() -> str | None:
             font-style:italic;'>Terminal</i></div>
         <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:{C['mute']};
             letter-spacing:1.6px;margin-bottom:20px;">MACRO · COMMODITIES · ALPHA</div>
-        """, unsafe_allow_html=True)
 
-        # ── Step 1: Get key ────────────────────────────────────────────────
-        st.markdown(f"""
-        <div style="background:rgba(45,212,167,.08);border:1px solid rgba(45,212,167,.25);
-            border-radius:8px;padding:12px 13px;margin-bottom:14px;">
-          <div style="font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;
-              color:{C['green']};letter-spacing:1px;margin-bottom:8px;">STEP 1 — GET FREE API KEY</div>
-          <div style="font-size:12px;color:{C['body']};line-height:1.7;">
-            1. Go to <a href="https://aistudio.google.com" target="_blank"
-               style="color:{C['blue']};font-weight:600;">aistudio.google.com</a><br>
-            2. Sign in with Google (free)<br>
-            3. Click <b style="color:{C['ink']};">Get API key → Create API key</b><br>
-            4. Copy it and paste below ↓
-          </div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;
+            color:{C['mute']};letter-spacing:1px;text-transform:uppercase;margin-bottom:10px;">
+            Data Sources</div>
+        <div style="font-size:12px;color:{C['body']};line-height:2.0;">
+          📈 <b>Prices</b> — Yahoo Finance (yfinance)<br>
+          🤖 <b>Analysis</b> — Gemini 1.5 Flash<br>
+          🔍 <b>Search</b> — Google Search grounding<br>
+          🏦 <b>CB rates &amp; CPI</b> — Gemini search<br>
+          💡 <b>Trade ideas</b> — Gemini analysis<br>
+          💰 <b>Daily cost</b> — <span style="color:{C['green']};">$0 total</span>
         </div>
         """, unsafe_allow_html=True)
-
-        # ── Step 2: Enter key ──────────────────────────────────────────────
-        st.markdown(f"""
-        <div style="font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;
-            color:{C['green']};letter-spacing:1px;margin-bottom:6px;">STEP 2 — PASTE KEY HERE</div>
-        """, unsafe_allow_html=True)
-
-        api_key = st.text_input(
-            "Gemini API Key",
-            type="password",
-            label_visibility="collapsed",
-            placeholder="AIzaSy... (paste your key here)",
-            help="Free key from aistudio.google.com — 1M tokens/day at no cost",
-        )
-
-        if api_key:
-            st.markdown(f"""
-            <div style="background:rgba(45,212,167,.08);border:1px solid rgba(45,212,167,.25);
-                border-radius:6px;padding:8px 10px;margin-top:6px;font-family:'JetBrains Mono',
-                monospace;font-size:10px;color:{C['green']};font-weight:700;">
-                ✓ Key entered — dashboard loading…
-            </div>""", unsafe_allow_html=True)
 
         st.divider()
 
         st.markdown(f"""
         <div style="font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;
             color:{C['mute']};letter-spacing:1px;text-transform:uppercase;margin-bottom:10px;">
-            Free Tier Limits</div>
-        <div style="font-size:11px;color:{C['body']};line-height:1.9;">
-          ● <b style="color:{C['green']};">1,500</b> requests / day<br>
-          ● <b style="color:{C['green']};">1,000,000</b> tokens / day<br>
-          ● Analysis cached <b>24 hours</b> (runs once/day)<br>
-          ● Prices refresh every <b>15 min</b> (yfinance)<br>
-          ● <b style="color:{C['green']};">Total daily cost: $0</b>
-        </div>
-        <div style="margin-top:16px;font-family:'JetBrains Mono',monospace;font-size:9px;
-            font-weight:700;color:{C['mute']};letter-spacing:1px;text-transform:uppercase;
-            margin-bottom:10px;">Data Sources</div>
-        <div style="font-size:11px;color:{C['body']};line-height:1.9;">
-          📈 <b>Prices & sectors</b> — Yahoo Finance<br>
-          🤖 <b>Analysis</b> — Gemini 1.5 Flash<br>
-          🔍 <b>Search</b> — Google Search grounding<br>
-          🏦 <b>CB rates & CPI</b> — Gemini search<br>
-          💡 <b>Trade ideas</b> — Gemini analysis
+            Cache Status</div>
+        <div style="font-size:12px;color:{C['body']};line-height:2.0;">
+          ⏱ Prices refresh every <b>15 min</b><br>
+          🧠 Analysis cached <b>24 hours</b><br>
+          🔑 API key from <b>Streamlit Secrets</b>
         </div>
         """, unsafe_allow_html=True)
 
-    return api_key.strip() if api_key else None
+        st.divider()
+        if st.button("↺  Refresh All Data", use_container_width=True, type="primary"):
+            st.cache_data.clear()
+            st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    api_key = sidebar_setup()
+    render_sidebar()
+
+    # ── Read API key from Streamlit Secrets (set once in dashboard, never exposed) ──
+    api_key = st.secrets.get("GEMINI_API_KEY", "").strip()
 
     # ── Header ───────────────────────────────────────────────────────────────
-    h1, h2, h3 = st.columns([3, 5, 2])
+    h1, h2 = st.columns([3, 7])
     with h1:
         st.markdown(f"""
         <div style="display:flex;align-items:center;gap:12px;padding:12px 0 8px 0;">
@@ -1068,49 +1039,67 @@ def main():
         <div style="font-size:10px;color:{C['dim']};font-family:'JetBrains Mono',monospace;margin-top:3px;">
           All % changes vs prior trading day regular session close · Prices: Yahoo Finance (15-min cache) · Analysis: Gemini (24-hr cache)
         </div>""", unsafe_allow_html=True)
-    with h3:
-        st.markdown("<div style='padding-top:8px;'>", unsafe_allow_html=True)
-        if st.button("↺  Refresh Prices", use_container_width=True, type="primary"):
-            st.cache_data.clear()
-            st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown(f"<hr style='border:none;border-top:1px solid {C['bord']};margin:0 0 12px 0;'>",
                 unsafe_allow_html=True)
 
-    # ── Gate on API key ───────────────────────────────────────────────────────
+    # ── No API key: show setup instructions ──────────────────────────────────
     if not api_key:
         st.markdown(f"""
-        <div style="background:{C['surf']};border:1px solid {C['bord']};border-radius:12px;
-            padding:40px;text-align:center;margin:40px auto;max-width:520px;">
-          <div style="font-family:'Instrument Serif',serif;font-size:52px;color:{C['green']};
-              font-style:italic;margin-bottom:12px;">α</div>
-          <div style="font-family:'Instrument Serif',serif;font-size:24px;color:{C['ink']};
-              margin-bottom:10px;">Paste your Gemini API key to begin</div>
+        <div style="background:{C['surf']};border:2px solid rgba(45,212,167,.35);
+            border-radius:12px;padding:32px;max-width:600px;margin:30px auto;">
+          <div style="font-family:'Instrument Serif',serif;font-size:48px;color:{C['green']};
+              font-style:italic;text-align:center;margin-bottom:12px;">α</div>
+          <div style="font-family:'Instrument Serif',serif;font-size:22px;color:{C['ink']};
+              text-align:center;margin-bottom:20px;">One-time setup: add your API key to Streamlit Secrets</div>
 
-          <div style="background:rgba(45,212,167,.08);border:2px solid rgba(45,212,167,.35);
-              border-radius:10px;padding:18px;margin:20px 0;text-align:left;">
-            <div style="font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;
-                color:{C['green']};letter-spacing:1px;margin-bottom:10px;">👈  THE SIDEBAR ON THE LEFT</div>
-            <div style="font-size:13px;color:{C['body']};line-height:1.9;">
-              <b style="color:{C['ink']};">1.</b> Look at the <b style="color:{C['green']};">left panel</b> — it should be open<br>
-              <b style="color:{C['ink']};">2.</b> If not visible, click the <b style="color:{C['green']};">› arrow</b> at the top-left edge<br>
-              <b style="color:{C['ink']};">3.</b> Paste your key in the <b style="color:{C['green']};">STEP 2 field</b><br>
-              <b style="color:{C['ink']};">4.</b> Dashboard loads instantly
+          <div style="counter-reset:step;">
+          <div style="display:flex;gap:12px;margin-bottom:14px;align-items:flex-start;">
+            <div style="background:{C['green']};color:{C['bg']};font-family:'JetBrains Mono',monospace;
+                font-weight:700;font-size:12px;padding:3px 8px;border-radius:4px;flex-shrink:0;">1</div>
+            <div style="font-size:13px;color:{C['body']};line-height:1.6;">
+              Get a <b style="color:{C['ink']};">free Gemini API key</b> at
+              <a href="https://aistudio.google.com" target="_blank" style="color:{C['blue']};font-weight:600;">
+              aistudio.google.com</a> → sign in with Google → <b>Get API key</b> → <b>Create API key</b>
+            </div>
+          </div>
+          <div style="display:flex;gap:12px;margin-bottom:14px;align-items:flex-start;">
+            <div style="background:{C['green']};color:{C['bg']};font-family:'JetBrains Mono',monospace;
+                font-weight:700;font-size:12px;padding:3px 8px;border-radius:4px;flex-shrink:0;">2</div>
+            <div style="font-size:13px;color:{C['body']};line-height:1.6;">
+              In Streamlit Cloud, open your app → click
+              <b style="color:{C['ink']};">⋮  (3-dot menu)</b> → <b style="color:{C['ink']};">Settings</b>
+              → <b style="color:{C['ink']};">Secrets</b>
+            </div>
+          </div>
+          <div style="display:flex;gap:12px;margin-bottom:14px;align-items:flex-start;">
+            <div style="background:{C['green']};color:{C['bg']};font-family:'JetBrains Mono',monospace;
+                font-weight:700;font-size:12px;padding:3px 8px;border-radius:4px;flex-shrink:0;">3</div>
+            <div style="font-size:13px;color:{C['body']};line-height:1.6;">
+              Paste exactly this into the Secrets text box:
+            </div>
+          </div>
+          </div>
+
+          <div style="background:{C['bg']};border:1px solid rgba(45,212,167,.3);border-radius:8px;
+              padding:14px 16px;margin:0 0 16px 0;font-family:'JetBrains Mono',monospace;
+              font-size:13px;color:{C['green']};">
+            GEMINI_API_KEY = "AIzaSy<span style='color:{C["mute"]};'>...your key here...</span>"
+          </div>
+
+          <div style="display:flex;gap:12px;margin-bottom:6px;align-items:flex-start;">
+            <div style="background:{C['green']};color:{C['bg']};font-family:'JetBrains Mono',monospace;
+                font-weight:700;font-size:12px;padding:3px 8px;border-radius:4px;flex-shrink:0;">4</div>
+            <div style="font-size:13px;color:{C['body']};line-height:1.6;">
+              Click <b style="color:{C['ink']};">Save</b> — the app auto-restarts and loads the dashboard. Done. ✓
             </div>
           </div>
 
-          <div style="font-size:13px;color:{C['body']};line-height:1.7;margin-bottom:16px;">
-            No key yet? Get one free at<br>
-            <a href="https://aistudio.google.com" target="_blank"
-                style="color:{C['blue']};font-size:14px;font-weight:600;">aistudio.google.com</a>
-            &nbsp;→ <b>Get API key</b> → <b>Create API key</b>
-          </div>
-
-          <div style="background:rgba(45,212,167,.05);border:1px solid rgba(45,212,167,.15);
-              border-radius:8px;padding:12px;font-size:11.5px;color:{C['body']};line-height:1.8;">
-            Free tier: <b style="color:{C['green']};">1,500 req/day · 1M tokens/day</b><br>
-            Analysis cached 24 hrs · Prices refresh every 15 min<br>
+          <div style="background:rgba(45,212,167,.06);border:1px solid rgba(45,212,167,.15);
+              border-radius:8px;padding:12px;font-size:11.5px;color:{C['body']};
+              line-height:1.8;margin-top:20px;text-align:center;">
+            Free tier: <b style="color:{C['green']};">1,500 req/day · 1M tokens/day</b> ·
+            Analysis cached 24 hrs · Prices from Yahoo Finance (free) ·
             <b style="color:{C['green']};">Total daily cost: $0</b>
           </div>
         </div>""", unsafe_allow_html=True)
