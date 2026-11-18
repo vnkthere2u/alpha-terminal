@@ -156,6 +156,6 @@ COT_LOOKBACK_WEEKS = 156
 
 MAX_SIGNALS_TO_LLM = 18
 
-# Claude settings (override via env)
-DEFAULT_MODEL = "claude-opus-5-5"
-NEWS_MAX_SEARCHES = 6
+# News window for the free headline feed (days)
+NEWS_DAYS_DAILY = 2
+NEWS_DAYS_WEEKLY = 7

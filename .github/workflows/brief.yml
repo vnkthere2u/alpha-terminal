@@ -17,7 +17,7 @@ on:
         type: boolean
         default: true
       llm:
-        description: "Run Claude analysis (off = quant-only, no API cost)"
+        description: "Run Gemini analysis (off = quant-only)"
         type: boolean
         default: true
 
@@ -48,11 +48,10 @@ jobs:
       - name: Generate brief
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
-          CLAUDE_EFFORT: ${{ vars.CLAUDE_EFFORT }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           DASHBOARD_URL: ${{ vars.DASHBOARD_URL }}
         run: |
           ARGS="--mode ${{ inputs.mode || 'auto' }}"

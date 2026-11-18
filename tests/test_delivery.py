@@ -59,43 +59,72 @@ def test_prior_summary():
     assert analyst.prior_summary(None) == ("none", "n/a")
 
 
-class _Blk:
-    def __init__(self, type, text=""):
-        self.type, self.text = type, text
+class _FakeAPIError(Exception):
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code = code
 
 
-class _Usage:
-    input_tokens, output_tokens = 1000, 200
-    cache_read_input_tokens = cache_creation_input_tokens = 0
+def _fake_analyst(handler):
+    """Analyst wired to a fake Gemini client; handler(model, contents, cfg) -> text or raises."""
+    from types import SimpleNamespace as NS
 
-    class server_tool_use:
-        web_search_requests = 2
-
-
-class _Resp:
-    def __init__(self, content, stop="end_turn"):
-        self.content, self.stop_reason, self.usage = content, stop, _Usage()
-
-
-def test_analyst_flow_with_fake_client():
     calls = []
 
-    class FakeMessages:
-        def create(self, **kw):
-            calls.append(kw)
-            if "tools" in kw:
-                if len(calls) == 1:
-                    return _Resp([_Blk("text", "Searching…"), _Blk("server_tool_use")], stop="pause_turn")
-                return _Resp([_Blk("web_search_tool_result"), _Blk("text", "[17 Nov] [US] CPI 3.1% vs 3.0% (BLS)")])
-            return _Resp([_Blk("text", json.dumps(SAMPLE))])
+    class Models:
+        def generate_content(self, model, contents, config):
+            calls.append((model, contents, config))
+            text = handler(model, contents, config)
+            gm = NS(web_search_queries=["q1", "q2"]) if config.get("tools") else None
+            return NS(text=text, candidates=[NS(grounding_metadata=gm, finish_reason="STOP")],
+                      usage_metadata=NS(prompt_token_count=1000, candidates_token_count=200,
+                                        thoughts_token_count=50, tool_use_prompt_token_count=0))
 
     an = analyst.Analyst.__new__(analyst.Analyst)
-    an.client = type("C", (), {"beta": type("B", (), {"messages": FakeMessages()})()})()
-    an.model, an.usage = "claude-opus-5-5", {"input_tokens": 0, "output_tokens": 0, "searches": 0}
-    news = an.news("Wed 18 Nov 2026", "Tue 17 Nov", ["Gold regime break"])
-    assert news == "[17 Nov] [US] CPI 3.1% vs 3.0% (BLS)"
+    an.client = NS(models=Models())
+    an.types = NS(GenerateContentConfig=lambda **kw: kw, Tool=lambda **kw: {"tool": kw},
+                  GoogleSearch=lambda: "google_search")
+    an.errors = NS(APIError=_FakeAPIError)
+    an.usage = {"input_tokens": 0, "output_tokens": 0, "searches": 0, "calls": 0}
+    an.grounded = False
+    an.models = list(analyst.MODEL_PREFS)
+    an.model = an.models[0]
+    return an, calls
+
+
+def test_gemini_flow_grounded():
+    def handler(model, contents, cfg):
+        if cfg.get("tools"):
+            return "[17 Nov] [US] CPI 3.1% vs 3.0% (BLS)"
+        return json.dumps(SAMPLE)
+    an, calls = _fake_analyst(handler)
+    news = an.news("Wed", "Tue", ["Gold regime break"], "[17 Nov] headline (Reuters)")
+    assert news.startswith("[17 Nov]") and an.grounded and an.usage["searches"] == 2
     out = an.synthesise("daily", "Wed", "2026-11-17", "digest", news, "none", "n/a")
     assert out["regime"]["label"] == "Late-cycle stress"
-    assert calls[0]["fallbacks"] == "default" and calls[0]["tools"][0]["max_uses"] == 6
-    assert calls[-1]["output_config"]["format"]["type"] == "json_schema"
-    assert an.usage["searches"] == 6 and an.cost_usd() > 0
+    assert calls[-1][2]["response_json_schema"] == analyst.SCHEMA
+    assert "headline (Reuters)" in calls[0][1]
+
+
+def test_gemini_falls_back_to_headlines_and_next_model():
+    def handler(model, contents, cfg):
+        if cfg.get("tools"):
+            raise _FakeAPIError(429, "Quota exceeded for grounding: limit 0 per day")
+        if model == analyst.MODEL_PREFS[0]:
+            raise _FakeAPIError(404, "model not found")
+        if "response_json_schema" in cfg:
+            return "```json\n" + json.dumps({"regime": {"label": "X"}}) + "\n```"
+        return "[17 Nov] headline-only fact"
+    an, calls = _fake_analyst(handler)
+    news = an.news("Wed", "Tue", [], "[17 Nov] headline (FT)")
+    assert news == "[17 Nov] headline-only fact" and not an.grounded
+    assert "no search tool" in calls[-1][1]
+    out = an.synthesise("daily", "Wed", "2026-11-17", "d", news, "none", "n/a")
+    assert out["regime"]["label"] == "X" and out["trends"] == [] and out["hidden_signal"]["title"] == ""
+    assert an.model == analyst.MODEL_PREFS[1]
+
+
+def test_schema_dialect_fallback_strips_additional_properties():
+    s = analyst._schema_without_additional(analyst.SCHEMA)
+    assert "additionalProperties" not in json.dumps(s)
+    assert "additionalProperties" in json.dumps(analyst.SCHEMA)

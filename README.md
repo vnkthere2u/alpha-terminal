@@ -1,7 +1,7 @@
 # AlphaTerminal — macro regime monitor
 
 A scheduled engine that tracks global macro markets, finds trend and regime changes
-with fixed quantitative rules, and has Claude turn them into a short brief. The brief
+with fixed quantitative rules, and has Google Gemini (free tier) turn them into a short brief. The brief
 goes to **Telegram at about 07:00 Dubai time** and to a **static dashboard on GitHub Pages**.
 There is no server, so nothing can go to sleep.
 
@@ -26,15 +26,18 @@ GitHub Actions (cron 02:41 UTC)
  │     positioning   CFTC managed-money / leveraged-fund 3-year percentiles and 4-week swings
  │     india         USD/INR volatility vs DXY (RBI smoothing) · Nifty-in-USD vs EM (FPI rotation)
  │     New signals rank above ongoing ones, so the brief favours what changed
- ├─ engine/analyst.py   Claude: (1) news scan with web search, capped at 6 searches, that also looks
- │                      for the causes of flagged moves; (2) synthesis into JSON with a fixed schema.
- │                      Every figure in the output is checked against the inputs; untraceable
- │                      figures are listed as caveats rather than shown as fact
+ ├─ engine/news.py      Free headlines: Google News RSS topic searches + Fed/ECB/RBI/BoJ press feeds
+ ├─ engine/analyst.py   Gemini (free tier), 2-3 calls per run: (1) news scan that also looks for the
+ │                      causes of flagged moves, using Google Search grounding when the free tier
+ │                      allows it, otherwise the headlines only; (2) synthesis into JSON with a
+ │                      fixed schema. The first available model is picked from a preference list,
+ │                      skipping models that are retired or out of daily quota. Every figure in the
+ │                      output is checked against the inputs; untraceable figures are listed as caveats
  ├─ engine/telegram.py  HTML brief, split safely at Telegram's 4,096-character limit
  └─ docs/               Static dashboard reading docs/data/*.json; each edition is archived
 ```
 
-If Claude or the news scan fails, the brief still goes out with quant signals only and
+If Gemini or the news scan fails, the brief still goes out with quant signals only and
 labels itself as such. If the whole run fails, Telegram gets a failure alert.
 
 ## One-time setup
@@ -48,15 +51,15 @@ labels itself as such. If the whole run fails, Telegram gets a failure alert.
    | Secret | Value |
    |---|---|
    | `FRED_API_KEY` | your FRED key |
-   | `ANTHROPIC_API_KEY` | key from console.anthropic.com |
+   | `GEMINI_API_KEY` | free key from aistudio.google.com → *Get API key* (no billing needed) |
    | `TELEGRAM_BOT_TOKEN` | from BotFather |
    | `TELEGRAM_CHAT_ID` | from getUpdates |
 
-   Optional repository **variables** are `CLAUDE_MODEL` (default `claude-opus-5-5`) and
-   `CLAUDE_EFFORT` (default `high`; `medium` is cheaper).
+   Optional repository **variable**: `GEMINI_MODEL`, to force a specific model. By default the
+   engine tries `gemini-flash-latest`, then `gemini-2.5-flash`, then the Flash-Lite versions.
 3. **Pages:** Settings → Pages → Source: **GitHub Actions**.
 4. **Merge to the default branch.** GitHub only runs scheduled workflows from the default branch.
-5. **First run:** Actions → *Macro brief* → *Run workflow*. Turn *Run Claude analysis* off
+5. **First run:** Actions → *Macro brief* → *Run workflow*. Turn *Run Gemini analysis* off
    for a free first test of the data feeds.
 
 The dashboard will be at `https://<owner>.github.io/alpha-terminal/`. The repo is public,
@@ -68,17 +71,24 @@ so the dashboard is public too.
 pip install -r requirements.txt pytest
 python -m pytest -q tests                                  # offline unit tests
 python -m engine.run --synthetic --no-llm --no-telegram --no-save --print
-FRED_API_KEY=... ANTHROPIC_API_KEY=... python -m engine.run --no-telegram --print
+FRED_API_KEY=... GEMINI_API_KEY=... python -m engine.run --no-telegram --print
 ```
 
 ## Cost
 
-- **GitHub Actions and Pages:** free for a public repo.
-- **Claude:** two calls per run.
-  - At Opus 5.5 list prices ($4 / $20 per 1M tokens, $10 per 1,000 searches), expect roughly
-    **$0.25–0.60 per run, about $8–15 a month**.
-  - The actual token use and estimated cost of each run are printed in the dashboard footer.
-  - To cut cost, set `CLAUDE_EFFORT=medium` or `CLAUDE_MODEL=claude-sonnet-5-5`.
+**$0.** GitHub Actions and Pages are free for a public repo, the news feeds are free RSS, and the
+engine needs 2–3 Gemini calls a day, well inside free-tier quotas.
+
+Free-tier trade-offs:
+- **Your prompts may be used by Google.** Google's terms allow free-tier inputs to be used to
+  improve its products. The inputs here are public market data and headlines.
+- **Search may not be available.** Google Search grounding is free only on some models
+  (reportedly the 2.5 Flash family). On models where it isn't free, the news scan works from
+  RSS headlines only, which carry fewer exact figures. The dashboard footer shows which mode
+  each edition used.
+- **Quotas are small and change.** Some newer Flash models reportedly allow only about 20
+  requests a day on the free tier. That is enough for this job, and the engine falls back to
+  Flash-Lite if a quota runs out.
 
 ## Limits
 

@@ -296,8 +296,8 @@
     if (n.gaps && n.gaps.length) caveats.push("Missing data: " + n.gaps.join(", "));
     $("#foot").replaceChildren(
       caveats.length ? el("p", null, "Caveats: " + caveats.join(" · ")) : null,
-      el("p", null, "Sources: Yahoo Finance (prices), FRED (rates, credit, liquidity), CFTC (positioning), web search via Claude (news). " +
-        (n.llm ? `Model ${n.llm.model} · ${n.llm.input_tokens.toLocaleString()} in / ${n.llm.output_tokens.toLocaleString()} out tokens · ${n.llm.searches} searches · ~$${n.llm.est_cost_usd}. ` : "") +
+      el("p", null, "Sources: Yahoo Finance (prices), FRED (rates, credit, liquidity), CFTC (positioning), news via Google News RSS, central-bank feeds and Gemini. " +
+        (n.llm ? `Model ${n.llm.model} · ${n.llm.input_tokens.toLocaleString()} in / ${n.llm.output_tokens.toLocaleString()} out tokens · ${n.llm.grounded ? n.llm.searches + " Google searches" : "headlines only (no search grounding)"}. ` : "") +
         "For information only; not investment advice."));
   }
 

@@ -2,12 +2,12 @@
 
     python -m engine.run                 # auto mode (Sunday Dubai = weekly, else daily)
     python -m engine.run --mode weekly
-    python -m engine.run --no-llm        # quant-only (no Anthropic cost)
+    python -m engine.run --no-llm        # quant-only (no Gemini calls)
     python -m engine.run --no-telegram --print
     python -m engine.run --synthetic     # offline smoke test with synthetic data
 
-Environment: FRED_API_KEY, ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-optional CLAUDE_MODEL, CLAUDE_EFFORT, DASHBOARD_URL.
+Environment: FRED_API_KEY, GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+optional GEMINI_MODEL, DASHBOARD_URL.
 """
 
 from __future__ import annotations
@@ -19,7 +19,8 @@ import sys
 import traceback
 from datetime import timedelta
 
-from . import signals, store, telegram
+from . import config, signals, store, telegram
+from . import news as newsfeed
 from .analyst import Analyst, audit_numbers, build_digest, dubai_now, prior_summary
 
 log = logging.getLogger("alpha")
@@ -96,12 +97,16 @@ def main(argv=None) -> int:
             "prev_signals_ref": prev_signals,
         }
 
-        if not args.no_llm and os.getenv("ANTHROPIC_API_KEY"):
+        if not args.no_llm and os.getenv("GEMINI_API_KEY"):
             digest = build_digest(q, gaps)
             an = Analyst()
             try:
+                days = (config.NEWS_DAYS_WEEKLY if mode == "weekly"
+                        else config.NEWS_DAYS_DAILY + (2 if now.weekday() == 0 else 0))
+                heads = newsfeed.as_text(newsfeed.headlines(days=days))
+                log.info("headlines collected: %d", len(heads.splitlines()))
                 titles = [s["title"] for s in q["signals"][:8]]
-                news = an.news(now.strftime("%a %d %b %Y"), news_since(mode, now), titles)
+                news = an.news(now.strftime("%a %d %b %Y"), news_since(mode, now), titles, heads)
                 note["news"] = news
             except Exception as e:
                 log.error("news scan failed: %s", e)
@@ -119,10 +124,10 @@ def main(argv=None) -> int:
             except Exception as e:
                 log.error("synthesis failed: %s", e)
                 note["gaps"].append("ai-synthesis")
-            note["llm"] = {"model": an.model, **an.usage, "est_cost_usd": an.cost_usd()}
+            note["llm"] = {"model": an.model, **an.usage, "grounded": an.grounded, "est_cost_usd": an.cost_usd()}
             log.info("LLM usage %s", note["llm"])
         elif not args.no_llm:
-            note["gaps"].append("no-anthropic-key")
+            note["gaps"].append("no-gemini-key")
 
         text = telegram.format_brief(note)
         if args.print:

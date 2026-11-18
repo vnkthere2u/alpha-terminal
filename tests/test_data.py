@@ -60,3 +60,23 @@ def test_net_liquidity_unit_normalisation():
     out = data.add_net_liquidity(p, {"WALCL": "Millions of U.S. Dollars", "TGA": "Billions of U.S. Dollars",
                                      "RRP": "Billions of U.S. Dollars"})
     assert out["NETLIQ"].iloc[-1] == 6_700 - 800 - 200
+
+
+def test_rss_parsing_and_dedupe(monkeypatch):
+    from datetime import datetime, timezone
+    from email.utils import format_datetime
+    from engine import news
+    now = format_datetime(datetime.now(timezone.utc))
+    rss = f"""<rss><channel>
+      <item><title>Fed holds rates steady - Reuters</title><pubDate>{now}</pubDate><source>Reuters</source></item>
+      <item><title>Fed holds rates steady - Bloomberg</title><pubDate>{now}</pubDate></item>
+      <item><title>Old story</title><pubDate>Mon, 01 Jan 2024 00:00:00 GMT</pubDate></item>
+    </channel></rss>"""
+    monkeypatch.setattr(news.requests, "get", lambda *a, **k: FakeResp(None) if False else type(
+        "R", (), {"ok": True, "text": rss})())
+    items = news.headlines(days=2)
+    titles = [i["title"] for i in items]
+    assert titles.count("Fed holds rates steady - Reuters") == 1
+    assert not any("Bloomberg" in t for t in titles)  # same story deduped
+    assert "Old story" not in titles
+    assert "Reuters" in news.as_text(items)

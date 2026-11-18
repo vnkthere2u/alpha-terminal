@@ -1,9 +1,14 @@
-"""Claude analysis layer.
+"""Gemini analysis layer (free tier).
 
-Two calls per run, sized for token economy:
-  1. News scan   - web search (capped), returns a terse fact list with numbers + sources.
+Two calls per run, sized for the free-tier daily request quota:
+  1. News scan   - free RSS headlines + (if the free tier allows it) Google Search
+                   grounding; returns a terse fact list with numbers + sources.
   2. Synthesis   - no tools; reads the quant digest + news facts + yesterday's view and
-                   returns schema-validated JSON (structured outputs).
+                   returns JSON constrained to a schema.
+
+Model choice is resilient to Google's model churn: the first available model from a
+preference list is used (override with GEMINI_MODEL), and a call that hits a missing
+model or an exhausted daily quota moves on to the next model.
 
 The synthesis is instructed to cite only figures present in its inputs; a post-check
 flags any figure it cannot trace back to the inputs (see `audit_numbers`).
@@ -11,22 +16,21 @@ flags any figure it cannot trace back to the inputs (see `audit_numbers`).
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
-import anthropic
 
 from . import config
 
 log = logging.getLogger(__name__)
 
-FALLBACK_BETA = "server-side-fallback-2026-07-01"
-# Opus 5.5 list price, USD per 1M tokens (input, output); web search per 1k searches.
-PRICE_IN, PRICE_OUT, PRICE_SEARCH = 4.0, 20.0, 10.0
+# Preference order: rolling aliases first (survive deprecations), then pinned fallbacks.
+MODEL_PREFS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"]
 
 
 # ─── Prompts ─────────────────────────────────────────────────────────────────
@@ -35,7 +39,12 @@ report only verifiable facts. You never speculate, never pad, never repeat backg
 
 NEWS_TASK = """Today is {today} (Dubai). Window: events since {since}.
 
-Search for what moved or will move macro markets in that window. Priorities:
+{search_line}
+
+Headlines collected from news feeds in the window (titles only):
+{headlines}
+
+Report what moved or will move macro markets in that window. Priorities:
 1. Central banks: Fed, ECB, BOJ, PBOC, RBI, BoE, SNB - decisions, minutes, notable speeches, balance-sheet/FX operations.
 2. Data prints with ACTUAL vs CONSENSUS vs PRIOR (US, China, Euro area, Japan, India).
 3. Energy & metals: OPEC+, inventories, central-bank gold buying, ETF flows, supply shocks.
@@ -51,7 +60,11 @@ Output format (plain text, no preamble, max ~600 words):
 - One line per fact: `[date] [region/asset] fact with exact numbers (source)`.
 - Up to 14 lines, most market-relevant first. Skip any category with nothing material.
 - A final line `CAUSES:` mapping flagged moves to a cause, or `unexplained` if none found.
-Never invent a number. If unsure of a figure, omit it."""
+Never invent a number. If unsure of a figure, omit it. Use only facts from search results
+or the headlines above; if a headline gives no figure, report it without one."""
+
+SEARCH_ON = "Use Google Search to verify and add figures (actual vs consensus, flows, levels)."
+SEARCH_OFF = "You have no search tool: work only from the headlines below."
 
 SYNTH_SYSTEM = """You are the chief macro strategist writing the morning note for a senior \
 finance professional (Dubai-based, India/Gulf exposure). The reader wants understanding, not \
@@ -263,76 +276,165 @@ def audit_numbers(analysis: dict, corpus: str) -> list[str]:
     return sorted(bad)
 
 
-# ─── Claude calls ────────────────────────────────────────────────────────────
+# ─── Gemini calls ────────────────────────────────────────────────────────────
+def _schema_without_additional(schema):
+    """Older Gemini schema dialect (response_schema) rejects additionalProperties."""
+    s = copy.deepcopy(schema)
+
+    def walk(n):
+        if isinstance(n, dict):
+            n.pop("additionalProperties", None)
+            for v in n.values():
+                walk(v)
+        elif isinstance(n, list):
+            for v in n:
+                walk(v)
+    walk(s)
+    return s
+
+
+def _parse_json(text: str) -> dict:
+    t = text.strip()
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t)
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        i, j = t.find("{"), t.rfind("}")
+        if i >= 0 and j > i:
+            return json.loads(t[i:j + 1])
+        raise
+
+
+def normalise(a: dict) -> dict:
+    """Guarantee every schema key exists so renderers never crash on a sparse reply."""
+    a = dict(a or {})
+    rg = a.get("regime") or {}
+    a["regime"] = {k: str(rg.get(k, "")) for k in ("label", "one_liner", "shift_vs_prior")}
+    for k in ("bottom_line", "developments", "trends", "watch", "data_caveats"):
+        a[k] = a.get(k) if isinstance(a.get(k), list) else []
+    hs = a.get("hidden_signal") or {}
+    a["hidden_signal"] = {k: str(hs.get(k, "")) for k in ("title", "evidence", "why_consensus_misses")}
+    a["india_gulf"] = str(a.get("india_gulf", ""))
+    a["trends"] = [dict(t, horizon=t.get("horizon") if t.get("horizon") in ("short", "medium", "long") else "medium",
+                        status=t.get("status") or "ongoing")
+                   for t in a["trends"] if isinstance(t, dict) and t.get("title")]
+    for d in a["developments"]:
+        for k in ("headline", "what_happened", "so_what", "second_order", "assets"):
+            d.setdefault(k, "")
+    for t in a["trends"]:
+        for k in ("evidence", "read"):
+            t.setdefault(k, "")
+    for w in a["watch"]:
+        w.setdefault("trigger", ""); w.setdefault("implication", "")
+    if not a["regime"]["label"]:
+        raise ValueError("synthesis returned no regime label")
+    return a
+
+
 class Analyst:
     def __init__(self, api_key: str | None = None, model: str | None = None):
-        self.client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
-        self.model = model or os.getenv("CLAUDE_MODEL", config.DEFAULT_MODEL)
-        self.usage = {"input_tokens": 0, "output_tokens": 0, "searches": 0}
+        from google import genai
+        from google.genai import errors, types
+        self.types, self.errors = types, errors
+        self.client = genai.Client(api_key=api_key or os.environ["GEMINI_API_KEY"])
+        self.usage = {"input_tokens": 0, "output_tokens": 0, "searches": 0, "calls": 0}
+        self.grounded = False
+        self.models = self._candidates(model or os.getenv("GEMINI_MODEL"))
+        self.model = self.models[0]
+
+    def _candidates(self, override: str | None) -> list[str]:
+        prefs = ([override] if override else []) + [m for m in MODEL_PREFS if m != override]
+        try:
+            available = {m.name.split("/")[-1] for m in self.client.models.list()}
+            found = [m for m in prefs if m in available]
+            if found:
+                return found
+        except Exception as e:
+            log.warning("model listing failed: %s", e)
+        return prefs
 
     def _account(self, resp):
-        u = resp.usage
-        self.usage["input_tokens"] += (u.input_tokens or 0) + (getattr(u, "cache_read_input_tokens", 0) or 0) \
-            + (getattr(u, "cache_creation_input_tokens", 0) or 0)
-        self.usage["output_tokens"] += u.output_tokens or 0
-        stu = getattr(u, "server_tool_use", None)
-        if stu is not None:
-            self.usage["searches"] += getattr(stu, "web_search_requests", 0) or 0
+        u = getattr(resp, "usage_metadata", None)
+        if u:
+            self.usage["input_tokens"] += (u.prompt_token_count or 0) + (getattr(u, "tool_use_prompt_token_count", 0) or 0)
+            self.usage["output_tokens"] += (u.candidates_token_count or 0) + (getattr(u, "thoughts_token_count", 0) or 0)
+        try:
+            gm = resp.candidates[0].grounding_metadata
+            q = getattr(gm, "web_search_queries", None) if gm else None
+            if q:
+                self.usage["searches"] += len(q)
+                self.grounded = True
+        except (AttributeError, IndexError, TypeError):
+            pass
+        self.usage["calls"] += 1
 
-    def _create(self, **kw):
-        resp = self.client.beta.messages.create(
-            model=self.model, betas=[FALLBACK_BETA], fallbacks="default", **kw)
-        self._account(resp)
-        if resp.stop_reason == "refusal":
-            raise RuntimeError(f"Model refused: {getattr(resp, 'stop_details', None)}")
-        return resp
+    def _generate(self, contents: str, config_kwargs: dict):
+        """Try each candidate model; wait out short rate limits, skip missing/exhausted models."""
+        last = None
+        for model in list(self.models):
+            for attempt in range(3):
+                try:
+                    resp = self.client.models.generate_content(
+                        model=model, contents=contents,
+                        config=self.types.GenerateContentConfig(**config_kwargs))
+                    self._account(resp)
+                    if not (resp.text or "").strip():
+                        raise RuntimeError(f"empty response from {model} "
+                                           f"(finish: {getattr(resp.candidates[0], 'finish_reason', '?') if resp.candidates else 'blocked'})")
+                    self.model = model
+                    return resp
+                except self.errors.APIError as e:
+                    last = e
+                    msg = str(e).lower()
+                    daily = any(k in msg for k in ("per day", "perday", "daily"))
+                    if e.code == 429 and not daily and attempt < 2:
+                        delay = re.search(r"retry in ([\d.]+)s|retrydelay[^\d]*(\d+)", msg)
+                        wait = float(next(g for g in delay.groups() if g)) if delay else 20.0
+                        time.sleep(min(wait + 1, 65))
+                        continue
+                    if e.code in (500, 503) and attempt < 2:
+                        time.sleep(10 * (attempt + 1))
+                        continue
+                    log.warning("model %s failed (%s): %s", model, e.code, str(e)[:200])
+                    break  # 404 / quota exhausted / bad request -> next model
+                except RuntimeError as e:
+                    last = e
+                    log.warning("%s", e)
+                    break
+        raise RuntimeError(f"all Gemini models failed: {last}")
 
-    @staticmethod
-    def _text(resp) -> str:
-        return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
-
-    def news(self, today: str, since: str, signal_titles: list[str]) -> str:
-        user = NEWS_TASK.format(today=today, since=since,
-                                signals="\n".join(f"- {t}" for t in signal_titles) or "- none")
-        messages = [{"role": "user", "content": user}]
-        tools = [{"type": "web_search_20260209", "name": "web_search",
-                  "max_uses": config.NEWS_MAX_SEARCHES}]
-        resp = self._create(system=NEWS_SYSTEM, max_tokens=8000, messages=messages, tools=tools,
-                            output_config={"effort": "medium"})
-        for _ in range(3):  # server-side tool loop can pause on long searches
-            if resp.stop_reason != "pause_turn":
-                break
-            messages = [{"role": "user", "content": user}, {"role": "assistant", "content": resp.content}]
-            resp = self._create(system=NEWS_SYSTEM, max_tokens=8000, messages=messages, tools=tools,
-                                output_config={"effort": "medium"})
-        # Keep only text written after the last search (earlier text is search narration).
-        parts: list[str] = []
-        for b in resp.content:
-            t = getattr(b, "type", "")
-            if t in ("server_tool_use", "web_search_tool_result"):
-                parts = []
-            elif t == "text":
-                parts.append(b.text)
-        return "".join(parts).strip() or self._text(resp)
+    def news(self, today: str, since: str, signal_titles: list[str], headlines: str = "") -> str:
+        sig = "\n".join(f"- {t}" for t in signal_titles) or "- none"
+        heads = headlines or "(none collected)"
+        base = dict(system_instruction=NEWS_SYSTEM, temperature=0.2, max_output_tokens=4096)
+        # 1st choice: Google Search grounding. Not free on every model/tier -> fall back to headlines.
+        try:
+            resp = self._generate(
+                NEWS_TASK.format(today=today, since=since, signals=sig, headlines=heads, search_line=SEARCH_ON),
+                dict(base, tools=[self.types.Tool(google_search=self.types.GoogleSearch())]))
+            return resp.text.strip()
+        except Exception as e:
+            log.warning("grounded news scan unavailable, using headlines only: %s", str(e)[:200])
+        resp = self._generate(
+            NEWS_TASK.format(today=today, since=since, signals=sig, headlines=heads, search_line=SEARCH_OFF), base)
+        return resp.text.strip()
 
     def synthesise(self, mode: str, today: str, asof: str, digest: str, news: str,
                    prior: str, prior_date: str) -> dict:
         user = SYNTH_TASK.format(mode=mode, today=today, asof=asof, mode_hint=MODE_HINTS[mode],
                                  prior=prior, prior_date=prior_date, digest=digest, news=news)
-        resp = self._create(
-            system=SYNTH_SYSTEM, max_tokens=16000,
-            messages=[{"role": "user", "content": user}],
-            output_config={"effort": os.getenv("CLAUDE_EFFORT", "high"),
-                           "format": {"type": "json_schema", "schema": SCHEMA}},
-        )
-        if resp.stop_reason == "max_tokens":
-            raise RuntimeError("Synthesis truncated at max_tokens")
-        return json.loads(self._text(resp))
+        base = dict(system_instruction=SYNTH_SYSTEM, temperature=0.3, max_output_tokens=16384,
+                    response_mime_type="application/json")
+        try:
+            resp = self._generate(user, dict(base, response_json_schema=SCHEMA))
+        except RuntimeError as e:
+            if "schema" not in str(e).lower():
+                raise
+            resp = self._generate(user, dict(base, response_schema=_schema_without_additional(SCHEMA)))
+        return normalise(_parse_json(resp.text))
 
     def cost_usd(self) -> float:
-        u = self.usage
-        return round(u["input_tokens"] / 1e6 * PRICE_IN + u["output_tokens"] / 1e6 * PRICE_OUT
-                     + u["searches"] / 1e3 * PRICE_SEARCH, 3)
+        return 0.0  # free tier
 
 
 def dubai_now() -> datetime:
