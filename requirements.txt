@@ -1,6 +1,5 @@
-streamlit
-yfinance
-pandas
-plotly
-fredapi
-google-genai
+anthropic>=2.10,<3
+numpy>=2.0
+pandas>=2.2
+requests>=2.31
+yfinance>=1.0

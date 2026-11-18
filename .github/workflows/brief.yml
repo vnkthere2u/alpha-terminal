@@ -1,0 +1,88 @@
+name: Macro brief
+
+on:
+  schedule:
+    # 02:41 UTC = 06:41 Dubai, Sun-Fri. Sunday runs the weekly review; Mon-Fri the daily brief.
+    # Scheduled runs can start 5-30 min late under GitHub load, so this targets ~07:00 delivery.
+    - cron: "41 2 * * 0-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Brief type"
+        type: choice
+        options: [auto, daily, weekly]
+        default: auto
+      telegram:
+        description: "Send to Telegram"
+        type: boolean
+        default: true
+      llm:
+        description: "Run Claude analysis (off = quant-only, no API cost)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: macro-brief
+  cancel-in-progress: false
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Generate brief
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+          CLAUDE_EFFORT: ${{ vars.CLAUDE_EFFORT }}
+          DASHBOARD_URL: ${{ vars.DASHBOARD_URL }}
+        run: |
+          ARGS="--mode ${{ inputs.mode || 'auto' }}"
+          if [ "${{ inputs.telegram }}" = "false" ]; then ARGS="$ARGS --no-telegram"; fi
+          if [ "${{ inputs.llm }}" = "false" ]; then ARGS="$ARGS --no-llm"; fi
+          python -m engine.run $ARGS
+
+      - name: Commit edition
+        run: |
+          git config user.name "alpha-terminal-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/data
+          if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
+          git commit -m "brief: $(TZ=Asia/Dubai date +%F)"
+          for i in 1 2 3 4; do
+            git push && break
+            sleep $((i * 5)); git pull --rebase
+          done
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  deploy:
+    needs: brief
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
